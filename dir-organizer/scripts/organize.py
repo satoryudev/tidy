@@ -8,9 +8,10 @@
   - 実行前に確認: preview(dry-run) で計画を提示してから apply する
 
 サブコマンド:
+  assess   ディレクトリを診断し、skill向きか手動向きか（あるいは触らない方がよいか）を判定
   scan     1つ以上のディレクトリを走査して scan.json を出力（移動しない）
   preview  plan.json を検証し、from→to をツリー表示（移動しない / 取り残し検出）
-  apply    plan.json に従って移動を実行し、manifest を記録
+  apply    plan.json に従って移動を実行し、manifest を記録（1件ごとに記録＝中断耐性あり）
   undo     最新 manifest を逆再生して元の状態に完全復元
 
 2つの使い方:
@@ -49,6 +50,17 @@ COURSE_KEYWORDS = (
     "lecture", "lec", "slide", "syllabus", "seminar", "assignment",
     "homework", "hw", "exam", "midterm", "final", "quiz", "course", "week",
 )
+
+# assess（診断）用。これらが見つかったらファイル移動は破壊的になりやすいので手動推奨。
+PROJECT_DIR_MARKERS = {
+    ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__",
+    ".terraform", ".next", ".idea", ".gradle",
+}
+PROJECT_FILE_MARKERS = {
+    "package.json", "pyproject.toml", "Cargo.toml", "go.mod", "pom.xml",
+    "build.gradle", "Makefile", "CMakeLists.txt", "tsconfig.json",
+    "requirements.txt", "Gemfile", "setup.py", "composer.json",
+}
 
 
 def _now() -> str:
@@ -347,8 +359,12 @@ def cmd_apply(args: argparse.Namespace) -> int:
         if not src_rel or not dst_rel:
             print(f"エラー: from/to 欠落: {m}", file=sys.stderr)
             return 1
-        src = _resolve_src(root, src_rel)
-        dst = _safe_join(root, dst_rel)
+        try:
+            src = _resolve_src(root, src_rel)
+            _safe_join(root, dst_rel)  # to が root 外なら弾く
+        except ValueError as e:
+            print(f"エラー: {e}", file=sys.stderr)
+            return 1
         if not src.is_file():
             print(f"エラー: 存在しないファイル: {src_rel}", file=sys.stderr)
             return 1
@@ -358,26 +374,43 @@ def cmd_apply(args: argparse.Namespace) -> int:
         print(f"{len(planned)} 件を移動します。確認のうえ --yes を付けて実行してください。")
         return 1
 
-    taken: set[Path] = set()
-    records: list[dict] = []
-    for src, dst_rel, reason in planned:
-        dst = _safe_join(root, dst_rel)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        final = _dedupe_dest(dst, taken)
-        taken.add(final)
-        shutil.move(str(src), str(final))
-        records.append({
-            "from": str(src),
-            "to": str(final),
-            "reason": reason,
-            "moved_at": _now(),
-        })
-
     log_dir = root / LOG_DIR
     log_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = log_dir / f"manifest-{_ts()}.json"
-    manifest = {"root": str(root), "applied_at": _now(), "moves": records}
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    records: list[dict] = []
+
+    def _flush(complete: bool) -> None:
+        # 各移動の直後に書き出すことで、途中で中断/クラッシュしても
+        # それまでの移動を undo で戻せるようにする（中断耐性）。
+        manifest = {"root": str(root), "applied_at": _now(),
+                    "complete": complete, "moves": records}
+        tmp = manifest_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, manifest_path)  # アトミックに置き換え
+
+    _flush(False)  # 移動前に空のジャーナルを作成
+    taken: set[Path] = set()
+    try:
+        for src, dst_rel, reason in planned:
+            dst = _safe_join(root, dst_rel)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            final = _dedupe_dest(dst, taken)
+            taken.add(final)
+            shutil.move(str(src), str(final))
+            records.append({
+                "from": str(src),
+                "to": str(final),
+                "reason": reason,
+                "moved_at": _now(),
+            })
+            _flush(False)  # 1件ごとにジャーナル更新（中断耐性）
+    except OSError as e:
+        _flush(False)
+        print(f"エラー: 移動中に失敗しました（{e}）。{len(records)} 件は完了済みで記録されています。",
+              file=sys.stderr)
+        print(f"元に戻す: python3 organize.py undo \"{root}\"", file=sys.stderr)
+        return 1
+    _flush(True)  # 全件完了
 
     moved_trash = sum(1 for r in records if f"/{TRASH_DIR}/" in r["to"])
     print(f"完了: {len(records)} 件を移動しました（うち {moved_trash} 件を {TRASH_DIR}/ へ隔離）。")
@@ -391,7 +424,8 @@ def _latest_manifest(root: Path) -> Path | None:
     log_dir = root / LOG_DIR
     if not log_dir.is_dir():
         return None
-    cands = sorted(log_dir.glob("manifest-*.json"))
+    cands = sorted(p for p in log_dir.glob("manifest-*.json")
+                   if not p.name.endswith(".undone.json"))  # 使用済みは除外
     return cands[-1] if cands else None
 
 
@@ -440,6 +474,124 @@ def cmd_undo(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- assess
+def cmd_assess(args: argparse.Namespace) -> int:
+    root = Path(args.dir).expanduser().resolve()
+    if not root.is_dir():
+        print(f"エラー: ディレクトリが見つかりません: {root}", file=sys.stderr)
+        return 2
+
+    total_files = loose_files = junk = symlinks = max_depth = 0
+    by_hash: dict[str, int] = {}
+    dir_markers: set[str] = set()
+    type_exts: set[str] = set()
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        d = Path(dirpath)
+        rel = d.relative_to(root)
+        depth = 0 if str(rel) == "." else len(rel.parts)
+        max_depth = max(max_depth, depth)
+        for dn in dirnames:
+            if dn in PROJECT_DIR_MARKERS:
+                dir_markers.add(dn)
+            if (d / dn).is_symlink():
+                symlinks += 1
+        # マーカー/予約ディレクトリの中には入らない（巨大化と誤整理を避ける）
+        dirnames[:] = [x for x in dirnames
+                       if x not in PROJECT_DIR_MARKERS and not _is_reserved(x)]
+        for name in filenames:
+            p = d / name
+            if p.is_symlink():
+                symlinks += 1
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            total_files += 1
+            if depth == 0:
+                loose_files += 1
+            if p.suffix:
+                type_exts.add(p.suffix.lower())
+            if _junk_reason(p, st.st_size):
+                junk += 1
+            if not args.no_hash:
+                dig = _hash_file(p)
+                if dig:
+                    by_hash[dig] = by_hash.get(dig, 0) + 1
+    dup_groups = sum(1 for c in by_hash.values() if c > 1)
+
+    try:
+        root_entries = set(os.listdir(root))
+    except OSError:
+        root_entries = set()
+    file_markers = sorted(root_entries & PROJECT_FILE_MARKERS)
+
+    home = Path.home()
+    # 「/」は全パスの祖先なので祖先判定に入れない（root==/ のときだけ該当させる）。
+    sensitive = [Path("/System"), Path("/usr"), Path("/bin"),
+                 Path("/Library"), home / "Library", Path("/Applications")]
+    in_sensitive = (root in (home, Path("/"))
+                    or any(root == s or s in root.parents for s in sensitive))
+
+    reasons: list[str] = []
+    if dir_markers or file_markers:
+        verdict, label = "NG", "skill非推奨（手動 or 対象を絞る）"
+        if dir_markers & {".git", ".hg", ".svn"}:
+            reasons.append("バージョン管理リポジトリ（.git 等）。ファイル移動は履歴・管理を壊します。")
+        if file_markers:
+            reasons.append(f"プロジェクト設定ファイル {file_markers} を検出。コードプロジェクトの可能性大。")
+        if dir_markers & {"node_modules", "__pycache__", ".venv", "venv", ".gradle"}:
+            reasons.append("依存・ビルド成果物フォルダ（node_modules/.venv 等）。構造に意味があり再生成物です。")
+        reasons.append("整理したいサブフォルダだけを対象にするか、手動で動かしてください。")
+    elif in_sensitive:
+        verdict, label = "NG", "触らない方がよい（重要な場所）"
+        reasons.append(f"ホーム直下またはシステム/ライブラリ配下です（{root}）。広範囲の移動は危険。")
+        reasons.append("Downloads など具体的な散らかりフォルダを指定してください。")
+    elif total_files == 0:
+        verdict, label = "SKIP", "対象なし（空ディレクトリ）"
+        reasons.append("ファイルがありません。")
+    elif total_files < 5:
+        verdict, label = "MANUAL", "手動でOK（量が少ない）"
+        reasons.append(f"ファイルが {total_files} 件だけ。自動化の手間に見合いません。")
+    else:
+        clutter = 0
+        clutter += 2 if loose_files >= 10 else 0
+        clutter += 1 if junk > 0 else 0
+        clutter += 1 if dup_groups > 0 else 0
+        clutter += 1 if len(type_exts) >= 4 else 0
+        clutter += 1 if max_depth == 0 else 0
+        if clutter >= 3:
+            verdict, label = "SKILL", "skill向き（自動整理が有効）"
+        else:
+            verdict, label = "MAYBE", "どちらでも（内容を見て判断）"
+        if loose_files >= 10:
+            reasons.append(f"直下にファイルが {loose_files} 件、ゆるく散らかっています。")
+        if junk:
+            reasons.append(f"ゴミ候補が {junk} 件（.DS_Store/.tmp 等）。")
+        if dup_groups:
+            reasons.append(f"同一内容の重複が {dup_groups} 組ありそうです。")
+        if len(type_exts) >= 4:
+            reasons.append(f"ファイル種別が多様（{len(type_exts)} 種）で分類のメリットあり。")
+        if max_depth >= 3 and clutter < 3:
+            reasons.append("すでにある程度フォルダ分けされています。")
+
+    print("== ディレクトリ診断 ==")
+    print(f"対象: {root}")
+    print(f"ファイル合計: {total_files} / 直下のゆるいファイル: {loose_files} / 最大階層: {max_depth}")
+    print(f"ゴミ候補: {junk} / 重複: {dup_groups}組 / シンボリックリンク: {symlinks}")
+    if dir_markers:
+        print(f"検出マーカー(dir): {sorted(dir_markers)}")
+    if file_markers:
+        print(f"検出マーカー(file): {file_markers}")
+    print()
+    print(f"判定 [{verdict}]: {label}")
+    for r in reasons:
+        print(f"  - {r}")
+    if symlinks and verdict in ("SKILL", "MAYBE", "MANUAL"):
+        print(f"  - 注意: シンボリックリンクが {symlinks} 個。移動するとリンク参照が壊れることがあります。")
+    return 0
+
+
 # --------------------------------------------------------------------------- cli
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="organize.py", description="安全なディレクトリ整理ツール")
@@ -469,6 +621,11 @@ def build_parser() -> argparse.ArgumentParser:
     ud.add_argument("dir", help="apply 時に指定した宛先ルート")
     ud.add_argument("--manifest", default=None, help="使用する manifest（省略時は最新）")
     ud.set_defaults(func=cmd_undo)
+
+    asm = sub.add_parser("assess", help="ディレクトリを診断し skill向き/手動向き を判定")
+    asm.add_argument("dir")
+    asm.add_argument("--no-hash", action="store_true", help="重複検出のハッシュ計算を省略（高速）")
+    asm.set_defaults(func=cmd_assess)
     return p
 
 
