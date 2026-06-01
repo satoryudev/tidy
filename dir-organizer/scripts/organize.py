@@ -8,10 +8,16 @@
   - 実行前に確認: preview(dry-run) で計画を提示してから apply する
 
 サブコマンド:
-  scan     対象を走査して scan.json を出力（移動しない）
+  scan     1つ以上のディレクトリを走査して scan.json を出力（移動しない）
   preview  plan.json を検証し、from→to をツリー表示（移動しない / 取り残し検出）
   apply    plan.json に従って移動を実行し、manifest を記録
   undo     最新 manifest を逆再生して元の状態に完全復元
+
+2つの使い方:
+  - その場整理: 1つのフォルダを中で分類する（plan の from は相対パス）
+  - 集約+重複排除: 複数の場所から関連ファイル（例: 講義資料）を1か所に集め、
+    同一内容の重複は1つだけ残して残りを _捨て へ（plan の from は絶対パス、
+    to は宛先ルートからの相対パス）
 """
 from __future__ import annotations
 
@@ -33,6 +39,15 @@ JUNK_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini", ".localized", "Icon\r"}
 JUNK_SUFFIXES = (
     ".tmp", ".temp", ".swp", ".swo", ".bak", ".orig",
     ".pyc", ".pyo", ".crdownload", ".part", ".download",
+)
+
+# 講義・授業資料らしさのヒント（パス/ファイル名に含まれていれば course_hint=True）。
+# あくまで Claude の判断を助ける目印で、最終決定は内容を見て行う。
+COURSE_KEYWORDS = (
+    "講義", "授業", "演習", "ゼミ", "資料", "レジュメ", "スライド", "シラバス",
+    "課題", "レポート", "試験", "過去問", "板書", "教材", "第", "回",
+    "lecture", "lec", "slide", "syllabus", "seminar", "assignment",
+    "homework", "hw", "exam", "midterm", "final", "quiz", "course", "week",
 )
 
 
@@ -78,6 +93,11 @@ def _junk_reason(p: Path, size: int) -> str | None:
     return None
 
 
+def _course_hint(rel_path: str) -> bool:
+    low = rel_path.lower()
+    return any(k in rel_path or k.lower() in low for k in COURSE_KEYWORDS)
+
+
 def _hash_file(p: Path) -> str | None:
     try:
         if p.stat().st_size > HASH_LIMIT:
@@ -103,69 +123,79 @@ def _read_snippet(p: Path, binary: bool, limit: int) -> str:
 
 # --------------------------------------------------------------------------- scan
 def cmd_scan(args: argparse.Namespace) -> int:
-    root = Path(args.dir).expanduser().resolve()
-    if not root.is_dir():
-        print(f"エラー: ディレクトリが見つかりません: {root}", file=sys.stderr)
-        return 2
+    roots: list[Path] = []
+    for d in args.dirs:
+        r = Path(d).expanduser().resolve()
+        if not r.is_dir():
+            print(f"エラー: ディレクトリが見つかりません: {r}", file=sys.stderr)
+            return 2
+        roots.append(r)
+    roots = _prune_nested_roots(roots)
 
     files: list[dict] = []
-    empty_dirs: list[str] = []
-    by_hash: dict[str, list[str]] = {}
+    empty_dirs: list[str] = []           # 絶対パス
+    by_hash: dict[str, list[str]] = {}   # sha1 -> 絶対パスのリスト（場所をまたいだ重複検出）
 
-    for dirpath, dirnames, filenames in os.walk(root):
-        d = Path(dirpath)
-        # 隔離/ログ用ディレクトリは触らない
-        dirnames[:] = [x for x in dirnames if not _is_reserved(x)]
-        rel_dir = d.relative_to(root)
-        depth = 0 if str(rel_dir) == "." else len(rel_dir.parts)
-        if args.depth is not None and depth >= args.depth:
-            dirnames[:] = []
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            d = Path(dirpath)
+            # 隔離/ログ用ディレクトリは触らない
+            dirnames[:] = [x for x in dirnames if not _is_reserved(x)]
+            rel_dir = d.relative_to(root)
+            depth = 0 if str(rel_dir) == "." else len(rel_dir.parts)
+            if args.depth is not None and depth >= args.depth:
+                dirnames[:] = []
 
-        if not dirnames and not filenames and str(rel_dir) != ".":
-            empty_dirs.append(str(rel_dir))
+            if not dirnames and not filenames and str(rel_dir) != ".":
+                empty_dirs.append(str(d))
 
-        for name in filenames:
-            p = d / name
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            size = st.st_size
-            with p.open("rb") as f:
-                head = f.read(8192)
-            binary = _looks_binary(head)
-            digest = _hash_file(p) if not args.no_hash else None
-            rel = str(p.relative_to(root))
-            if digest:
-                by_hash.setdefault(digest, []).append(rel)
-            files.append({
-                "path": rel,
-                "size": size,
-                "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
-                "ext": p.suffix.lower(),
-                "binary": binary,
-                "junk": _junk_reason(p, size) is not None,
-                "junk_reason": _junk_reason(p, size),
-                "sha1": digest,
-                "snippet": _read_snippet(p, binary, args.max_snippet),
-            })
+            for name in filenames:
+                p = d / name
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                size = st.st_size
+                with p.open("rb") as f:
+                    head = f.read(8192)
+                binary = _looks_binary(head)
+                digest = _hash_file(p) if not args.no_hash else None
+                rel = str(p.relative_to(root))
+                if digest:
+                    by_hash.setdefault(digest, []).append(str(p))
+                files.append({
+                    "abspath": str(p),
+                    "path": rel,
+                    "root": str(root),
+                    "size": size,
+                    "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+                    "ext": p.suffix.lower(),
+                    "binary": binary,
+                    "junk": _junk_reason(p, size) is not None,
+                    "junk_reason": _junk_reason(p, size),
+                    "course_hint": _course_hint(rel),
+                    "sha1": digest,
+                    "snippet": _read_snippet(p, binary, args.max_snippet),
+                })
 
     duplicates = [sorted(v) for v in by_hash.values() if len(v) > 1]
     report = {
-        "root": str(root),
+        "roots": [str(r) for r in roots],
+        "root": str(roots[0]) if len(roots) == 1 else None,
         "scanned_at": _now(),
         "depth": args.depth,
         "trash_dir": TRASH_DIR,
         "log_dir": LOG_DIR,
         "file_count": len(files),
-        "files": sorted(files, key=lambda x: x["path"]),
+        "files": sorted(files, key=lambda x: x["abspath"]),
         "empty_dirs": sorted(empty_dirs),
         "duplicates": duplicates,
     }
     out = json.dumps(report, ensure_ascii=False, indent=2)
     if args.out:
         Path(args.out).write_text(out, encoding="utf-8")
-        print(f"スキャン完了: {len(files)} ファイル / 重複 {len(duplicates)} 組 / 空dir {len(empty_dirs)} 個")
+        print(f"スキャン完了: {len(files)} ファイル / 重複 {len(duplicates)} 組 / "
+              f"空dir {len(empty_dirs)} 個 / 対象 {len(roots)} ディレクトリ")
         print(f"  → {args.out} に書き出しました")
     else:
         print(out)
@@ -182,11 +212,31 @@ def _load_plan(plan_path: str):
 
 
 def _safe_join(root: Path, rel: str) -> Path:
-    """root の外に出る相対パスを拒否する。"""
+    """root の外に出る相対パスを拒否する（移動先の安全確保に使う）。"""
     target = (root / rel).resolve()
     if root not in target.parents and target != root:
         raise ValueError(f"root の外を指すパスは許可されません: {rel}")
     return target
+
+
+def _resolve_src(root: Path, src: str) -> Path:
+    """移動元を解決する。絶対パスはそのまま（複数の場所から集約するため）、
+    相対パスは root 配下に限定する（その場整理での `../` 脱出を防ぐ）。"""
+    p = Path(src).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    return _safe_join(root, src)
+
+
+def _prune_nested_roots(roots: list[Path]) -> list[Path]:
+    """親子関係にある root を間引き、二重走査を防ぐ。"""
+    uniq = sorted(set(roots), key=lambda p: len(p.parts))
+    kept: list[Path] = []
+    for r in uniq:
+        if any(k == r or k in r.parents for k in kept):
+            continue
+        kept.append(r)
+    return kept
 
 
 def _dedupe_dest(dst: Path, taken: set[Path]) -> Path:
@@ -217,7 +267,7 @@ def cmd_preview(args: argparse.Namespace) -> int:
 
     errors: list[str] = []
     grouped: dict[str, list[tuple[str, str]]] = {}
-    seen_from: set[str] = set()
+    seen_rel: set[str] = set()   # root 配下から動かす元ファイル（取り残し検出用）
     dest_count: dict[Path, int] = {}
 
     for m in moves:
@@ -226,23 +276,26 @@ def cmd_preview(args: argparse.Namespace) -> int:
             errors.append(f"from/to が欠けています: {m}")
             continue
         try:
-            src = _safe_join(root, src_rel)
+            src = _resolve_src(root, src_rel)
             dst = _safe_join(root, dst_rel)
         except ValueError as e:
             errors.append(str(e))
             continue
         if not src.is_file():
             errors.append(f"存在しないファイル: {src_rel}")
-        seen_from.add(src_rel)
+        try:  # root 配下の元ファイルだけ取り残し判定に含める（外部からの集約は対象外）
+            seen_rel.add(str(src.relative_to(root)))
+        except ValueError:
+            pass
         dest_count[dst] = dest_count.get(dst, 0) + 1
         top = Path(dst_rel).parts[0] if Path(dst_rel).parts else dst_rel
         grouped.setdefault(top, []).append((src_rel, dst_rel))
 
     collisions = [str(d.relative_to(root)) for d, c in dest_count.items() if c > 1]
 
-    # 取り残し検出: 現在あるのに plan に出てこないファイル（「どこいった」防止）
+    # 取り残し検出: root 配下に現在あるのに plan に出てこないファイル（「どこいった」防止）
     present = _current_files(root)
-    uncovered = sorted(present - seen_from)
+    uncovered = sorted(present - seen_rel)
 
     print(f"== 整理プレビュー（dry-run・移動しません） ==")
     print(f"対象: {root}")
@@ -294,7 +347,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
         if not src_rel or not dst_rel:
             print(f"エラー: from/to 欠落: {m}", file=sys.stderr)
             return 1
-        src = _safe_join(root, src_rel)
+        src = _resolve_src(root, src_rel)
         dst = _safe_join(root, dst_rel)
         if not src.is_file():
             print(f"エラー: 存在しないファイル: {src_rel}", file=sys.stderr)
@@ -392,8 +445,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="organize.py", description="安全なディレクトリ整理ツール")
     sub = p.add_subparsers(dest="command", required=True)
 
-    s = sub.add_parser("scan", help="走査して scan.json を出力")
-    s.add_argument("dir")
+    s = sub.add_parser("scan", help="1つ以上のディレクトリを走査して scan.json を出力")
+    s.add_argument("dirs", nargs="+", metavar="dir", help="走査するディレクトリ（複数指定可）")
     s.add_argument("--depth", type=int, default=None, help="走査する最大階層")
     s.add_argument("--out", default=None, help="出力先 JSON（省略時は標準出力）")
     s.add_argument("--max-snippet", type=int, default=SNIPPET_DEFAULT, help="内容スニペットの最大文字数")
@@ -401,19 +454,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_scan)
 
     pv = sub.add_parser("preview", help="plan.json を検証して dry-run 表示")
-    pv.add_argument("dir")
+    pv.add_argument("dir", help="宛先ルート（_捨て/_整理ログ を置く場所。全 to はこの中に入る）")
     pv.add_argument("--in", dest="infile", required=True, help="plan.json")
     pv.add_argument("--limit", type=int, default=20, help="宛先ごとの表示件数上限")
     pv.set_defaults(func=cmd_preview)
 
     ap = sub.add_parser("apply", help="plan.json に従って移動を実行")
-    ap.add_argument("dir")
+    ap.add_argument("dir", help="宛先ルート（_捨て/_整理ログ を置く場所。全 to はこの中に入る）")
     ap.add_argument("--in", dest="infile", required=True, help="plan.json")
     ap.add_argument("--yes", action="store_true", help="確認をスキップして実行")
     ap.set_defaults(func=cmd_apply)
 
     ud = sub.add_parser("undo", help="最新 manifest を逆再生して復元")
-    ud.add_argument("dir")
+    ud.add_argument("dir", help="apply 時に指定した宛先ルート")
     ud.add_argument("--manifest", default=None, help="使用する manifest（省略時は最新）")
     ud.set_defaults(func=cmd_undo)
     return p
