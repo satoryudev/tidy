@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""dir-organizer の総合テスト。
+"""tidy の総合テスト。
 
 一時的な「仮想ディレクトリ」(sandbox) を作り、考えられるケースを片っ端から検証する。
 organize.py を実際に CLI として呼び出す結合テスト（黒箱）。標準ライブラリのみで動く。
@@ -319,7 +319,7 @@ CASES = [
 
 
 def main() -> int:
-    box = Path(tempfile.mkdtemp(prefix="dir-organizer-test-"))
+    box = Path(tempfile.mkdtemp(prefix="tidy-test-"))
     print(f"sandbox: {box}\n")
     try:
         for case in CASES:

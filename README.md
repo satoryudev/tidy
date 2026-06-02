@@ -1,4 +1,4 @@
-# dir-organizer
+# tidy
 
 [Claude Code](https://claude.com/claude-code) で使える、**安全なディレクトリ整理スキル**。
 
@@ -19,22 +19,22 @@
 
 ## インストール
 
-このリポジトリ自体が1つのスキルです。`~/.claude/skills/dir-organizer` として置けば使えます。
+このリポジトリ自体が1つのスキルです。`~/.claude/skills/tidy` として置けば使えます。
 
 ### 方法A: コピー
 ```bash
 git clone https://github.com/satoryudev/tidy.git
-cp -r tidy ~/.claude/skills/dir-organizer
+cp -r tidy ~/.claude/skills/tidy
 ```
 
 ### 方法B: シンボリックリンク（リポジトリの更新が即反映される）
 ```bash
 git clone https://github.com/satoryudev/tidy.git
-ln -s "$(pwd)/tidy" ~/.claude/skills/dir-organizer
+ln -s "$(pwd)/tidy" ~/.claude/skills/tidy
 ```
 
 インストール後、Claude Code で「このフォルダを整理して」「講義資料をまとめて」などと頼むと
-自動で発火します。`/dir-organizer` と打って明示的に呼ぶこともできます。
+自動で発火します。`/tidy` と打って明示的に呼ぶこともできます。
 
 ## CLI として単体利用（スキルを使わず手動で）
 
