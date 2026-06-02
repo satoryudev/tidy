@@ -23,14 +23,14 @@
 
 ### 方法A: コピー
 ```bash
-git clone https://github.com/satoryudev/dir-organizer.git
-cp -r dir-organizer ~/.claude/skills/dir-organizer
+git clone https://github.com/satoryudev/tidy.git
+cp -r tidy ~/.claude/skills/dir-organizer
 ```
 
 ### 方法B: シンボリックリンク（リポジトリの更新が即反映される）
 ```bash
-git clone https://github.com/satoryudev/dir-organizer.git
-ln -s "$(pwd)/dir-organizer" ~/.claude/skills/dir-organizer
+git clone https://github.com/satoryudev/tidy.git
+ln -s "$(pwd)/tidy" ~/.claude/skills/dir-organizer
 ```
 
 インストール後、Claude Code で「このフォルダを整理して」「講義資料をまとめて」などと頼むと
