@@ -311,10 +311,184 @@ def t_assess_organized(box: Path):
     check("assess: 整理済みは SKILL ではない", verdict_of(a.stdout) != "SKILL", a.stdout)
 
 
+def t_suggest_inplace(box: Path):
+    """suggest: 単一 root から baseline plan を作り、preview/apply まで走る。"""
+    r = box / "sg_inplace"
+    r.mkdir()
+    (r / "仕様メモ.md").write_text("# 仕様\n本文\n", encoding="utf-8")
+    (r / "run.py").write_text("#!/usr/bin/env python3\nprint(1)\n", encoding="utf-8")
+    (r / "data.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    (r / "photo.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    (r / ".DS_Store").write_bytes(b"")
+    (r / "dup.txt").write_text("dup\n", encoding="utf-8")
+    (r / "dup のコピー.txt").write_text("dup\n", encoding="utf-8")
+
+    scan_p = box / "sg_in.scan.json"
+    plan_p = box / "sg_in.plan.json"
+    sc = run("scan", str(r), "--out", str(scan_p))
+    check("suggest/inplace: scan rc=0", sc.returncode == 0, sc.stderr)
+    sg = run("suggest", "--in", str(scan_p), "--out", str(plan_p))
+    check("suggest/inplace: rc=0", sg.returncode == 0, sg.stderr)
+
+    plan = json.loads(plan_p.read_text(encoding="utf-8"))
+    check("suggest/inplace: mode は in-place", plan["mode"] == "in-place", plan.get("mode"))
+    by_from = {m["from"]: m["to"] for m in plan["moves"]}
+    check("suggest/inplace: 仕様md は 仕様/ へ",
+          by_from.get("仕様メモ.md", "").startswith("ドキュメント/仕様/"), str(by_from))
+    check("suggest/inplace: シェバン py は コード/ へ",
+          by_from.get("run.py", "").startswith("コード/"), str(by_from))
+    check("suggest/inplace: png は 画像/ へ",
+          by_from.get("photo.png", "").startswith("画像/"), str(by_from))
+    check("suggest/inplace: csv は データ/ へ",
+          by_from.get("data.csv", "").startswith("データ/"), str(by_from))
+    check("suggest/inplace: .DS_Store は _捨て/ へ",
+          by_from.get(".DS_Store", "").startswith("_捨て/"), str(by_from))
+    # 重複の片方が _捨て へ、もう片方が通常分類へ
+    dup_to = [by_from["dup.txt"], by_from["dup のコピー.txt"]]
+    trash_count = sum(1 for t in dup_to if t.startswith("_捨て/"))
+    check("suggest/inplace: 重複の片方だけ隔離", trash_count == 1, str(dup_to))
+
+    # 生成した plan で apply まで通る
+    pv = run("preview", str(r), "--in", str(plan_p))
+    check("suggest/inplace: preview OK", pv.returncode == 0, pv.stdout)
+    ap = run("apply", str(r), "--in", str(plan_p), "--yes")
+    check("suggest/inplace: apply OK", ap.returncode == 0, ap.stderr)
+
+
+def t_suggest_consolidate(box: Path):
+    """suggest: 複数 root と --target で集約モード plan を作る。"""
+    dl, desk, target = box / "sg_dl", box / "sg_desk", box / "sg_target"
+    dl.mkdir(); desk.mkdir(); target.mkdir()
+    (dl / "第3回_線形代数.pdf").write_text("LA week3\n", encoding="utf-8")
+    (desk / "線形代数_第3回.pdf").write_text("LA week3\n", encoding="utf-8")  # 重複
+    (dl / "個人メモ.txt").write_text("private\n", encoding="utf-8")
+
+    scan_p = box / "sg_con.scan.json"
+    plan_p = box / "sg_con.plan.json"
+    run("scan", str(dl), str(desk), "--out", str(scan_p))
+
+    # --target なしはエラー（multi-root + no target）
+    sg_err = run("suggest", "--in", str(scan_p), "--out", str(plan_p))
+    check("suggest/consolidate: --target 無しは rc=2", sg_err.returncode == 2, sg_err.stderr)
+
+    sg = run("suggest", "--in", str(scan_p), "--out", str(plan_p), "--target", str(target))
+    check("suggest/consolidate: rc=0", sg.returncode == 0, sg.stderr)
+    plan = json.loads(plan_p.read_text(encoding="utf-8"))
+    check("suggest/consolidate: mode は consolidate", plan["mode"] == "consolidate", plan.get("mode"))
+    # 集約モードでは from が絶対パス
+    abs_count = sum(1 for m in plan["moves"] if Path(m["from"]).is_absolute())
+    check("suggest/consolidate: from は絶対パス", abs_count == len(plan["moves"]), str(plan["moves"]))
+    # 重複1組 → 片方は _捨て、片方は ドキュメント/講義/ 等の通常分類
+    trash_count = sum(1 for m in plan["moves"] if m["to"].startswith("_捨て/"))
+    check("suggest/consolidate: 重複の片方を隔離", trash_count == 1, str(plan["moves"]))
+
+
+def t_verify_clean_and_dirty(box: Path):
+    """verify: 正常状態 OK / from が残ってる or to が消えると問題報告。"""
+    r = box / "verify_box"
+    r.mkdir()
+    (r / "x.txt").write_text("x", encoding="utf-8")
+    plan_p = box / "verify.plan.json"
+    write_json(plan_p, {"root": str(r), "trash_dir": "_捨て",
+                        "moves": [{"from": "x.txt", "to": "d/x.txt"}]})
+    run("apply", str(r), "--in", str(plan_p), "--yes")
+    v_ok = run("verify", str(r))
+    check("verify: 正常状態は rc=0", v_ok.returncode == 0
+          and "1 / 1" in v_ok.stdout, v_ok.stdout)
+
+    # 移動先を消して dirty にする → verify が問題報告
+    (r / "d" / "x.txt").unlink()
+    v_bad = run("verify", str(r))
+    check("verify: 移動先消失で rc=1", v_bad.returncode == 1
+          and "消失" in v_bad.stdout, v_bad.stdout)
+
+
+def t_verify_no_manifest(box: Path):
+    """verify: manifest 無しなら rc=2。"""
+    r = box / "verify_empty"
+    r.mkdir()
+    v = run("verify", str(r))
+    check("verify: manifest 無しで rc=2", v.returncode == 2, v.stdout + v.stderr)
+
+
+def t_redo_after_undo(box: Path):
+    """redo: undo 後に redo して apply 後の状態に戻る。"""
+    r = box / "redo_box"
+    r.mkdir()
+    (r / "a.txt").write_text("A", encoding="utf-8")
+    (r / "b.txt").write_text("B", encoding="utf-8")
+    plan_p = box / "redo.plan.json"
+    write_json(plan_p, {"root": str(r), "trash_dir": "_捨て", "moves": [
+        {"from": "a.txt", "to": "g/a.txt"},
+        {"from": "b.txt", "to": "g/b.txt"},
+    ]})
+    run("apply", str(r), "--in", str(plan_p), "--yes")
+    applied = snapshot(r)
+    run("undo", str(r))
+    rd = run("redo", str(r))
+    check("redo: rc=0", rd.returncode == 0, rd.stderr)
+    check("redo: apply 後と同じ状態に戻る", snapshot(r) == applied,
+          f"{applied} != {snapshot(r)}")
+    # 同じ undo を二度 redo できない
+    rd2 = run("redo", str(r))
+    check("redo: 二回目は rc=2", rd2.returncode == 2, rd2.stdout + rd2.stderr)
+
+
+def t_self_move_rejected(box: Path):
+    """from == to の plan は preview と apply の両方で拒否される。"""
+    r = box / "selfmove"
+    r.mkdir()
+    (r / "x.txt").write_text("x", encoding="utf-8")
+    plan_p = box / "self.plan.json"
+    write_json(plan_p, {"root": str(r), "trash_dir": "_捨て",
+                        "moves": [{"from": "x.txt", "to": "x.txt"}]})
+    pv = run("preview", str(r), "--in", str(plan_p))
+    check("self-move: preview がエラー", pv.returncode == 1
+          and "同じです" in pv.stdout, pv.stdout)
+    ap = run("apply", str(r), "--in", str(plan_p), "--yes")
+    check("self-move: apply もエラー", ap.returncode != 0
+          and (r / "x.txt").is_file(), ap.stderr)
+
+
+def t_apply_dry_run(box: Path):
+    """apply --dry-run は preview と等価で、ファイルは動かない。"""
+    r = box / "dryrun"
+    r.mkdir()
+    (r / "a.txt").write_text("a", encoding="utf-8")
+    plan_p = box / "dryrun.plan.json"
+    write_json(plan_p, {"root": str(r), "trash_dir": "_捨て",
+                        "moves": [{"from": "a.txt", "to": "d/a.txt"}]})
+    dr = run("apply", str(r), "--in", str(plan_p), "--dry-run")
+    check("apply --dry-run: rc=0", dr.returncode == 0, dr.stderr)
+    check("apply --dry-run: ファイルは動かない", (r / "a.txt").is_file(), "moved!")
+    check("apply --dry-run: dry-run らしい表記が出る",
+          "プレビュー" in dr.stdout or "移動しません" in dr.stdout, dr.stdout)
+
+
+def t_preview_shows_size(box: Path):
+    """preview の総サイズ表示が正しい。"""
+    r = box / "size_box"
+    r.mkdir()
+    (r / "big.txt").write_text("x" * 2048, encoding="utf-8")
+    (r / "small.txt").write_text("y", encoding="utf-8")
+    plan_p = box / "size.plan.json"
+    write_json(plan_p, {"root": str(r), "trash_dir": "_捨て", "moves": [
+        {"from": "big.txt", "to": "d/big.txt"},
+        {"from": "small.txt", "to": "_捨て/small.txt"},
+    ]})
+    pv = run("preview", str(r), "--in", str(plan_p))
+    check("preview: 総サイズが KB 表示される", "2.0 KB" in pv.stdout or "2049" in pv.stdout, pv.stdout)
+    check("preview: 隔離分のサイズも表記される", "_捨て/ へ" in pv.stdout, pv.stdout)
+
+
 CASES = [
     t_inplace_roundtrip, t_junk_and_types, t_consolidate_dedupe, t_collision,
     t_preview_uncovered, t_safety_escape, t_requires_yes, t_interrupt_resilience,
     t_undo_twice, t_assess_project, t_assess_clutter, t_assess_small, t_assess_organized,
+    # new
+    t_suggest_inplace, t_suggest_consolidate, t_verify_clean_and_dirty,
+    t_verify_no_manifest, t_redo_after_undo, t_self_move_rejected,
+    t_apply_dry_run, t_preview_shows_size,
 ]
 
 

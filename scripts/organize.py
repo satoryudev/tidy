@@ -10,9 +10,12 @@
 サブコマンド:
   assess   ディレクトリを診断し、skill向きか手動向きか（あるいは触らない方がよいか）を判定
   scan     1つ以上のディレクトリを走査して scan.json を出力（移動しない）
+  suggest  scan.json から baseline plan.json を自動生成（拡張子・内容・重複群から判断）
   preview  plan.json を検証し、from→to をツリー表示（移動しない / 取り残し検出）
   apply    plan.json に従って移動を実行し、manifest を記録（1件ごとに記録＝中断耐性あり）
+  verify   apply 直後の整合性チェック（from が消え、to が存在することを確認）
   undo     最新 manifest を逆再生して元の状態に完全復元
+  redo     直前の undo を取り消し、apply 後の状態へ戻す
 
 2つの使い方:
   - その場整理: 1つのフォルダを中で分類する（plan の from は相対パス）
@@ -273,6 +276,15 @@ def _current_files(root: Path) -> set[str]:
 
 
 # --------------------------------------------------------------------------- preview
+def _humanize_bytes(n: int) -> str:
+    """人間が読みやすいバイト表記。"""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+        n /= 1024
+    return f"{n} B"  # 到達しないが型のため
+
+
 def cmd_preview(args: argparse.Namespace) -> int:
     root = Path(args.dir).expanduser().resolve()
     data, moves = _load_plan(args.infile)
@@ -281,6 +293,8 @@ def cmd_preview(args: argparse.Namespace) -> int:
     grouped: dict[str, list[tuple[str, str]]] = {}
     seen_rel: set[str] = set()   # root 配下から動かす元ファイル（取り残し検出用）
     dest_count: dict[Path, int] = {}
+    total_bytes = 0
+    trash_bytes = 0
 
     for m in moves:
         src_rel, dst_rel = m.get("from"), m.get("to")
@@ -295,6 +309,18 @@ def cmd_preview(args: argparse.Namespace) -> int:
             continue
         if not src.is_file():
             errors.append(f"存在しないファイル: {src_rel}")
+        elif src.resolve() == dst.resolve():
+            # from == to は意味のない move（apply で SameFileError になる）→ 早期に弾く
+            errors.append(f"移動元と移動先が同じです: {src_rel}")
+        else:
+            # サイズ集計は実在ファイルだけで（エラー時は当然 0 扱い）
+            try:
+                size = src.stat().st_size
+                total_bytes += size
+                if dst_rel.startswith(f"{TRASH_DIR}/") or f"/{TRASH_DIR}/" in dst_rel:
+                    trash_bytes += size
+            except OSError:
+                pass
         try:  # root 配下の元ファイルだけ取り残し判定に含める（外部からの集約は対象外）
             seen_rel.add(str(src.relative_to(root)))
         except ValueError:
@@ -311,7 +337,9 @@ def cmd_preview(args: argparse.Namespace) -> int:
 
     print(f"== 整理プレビュー（dry-run・移動しません） ==")
     print(f"対象: {root}")
-    print(f"移動予定: {len(moves)} 件\n")
+    print(f"移動予定: {len(moves)} 件 / 総サイズ {_humanize_bytes(total_bytes)}"
+          + (f" (うち {TRASH_DIR}/ へ {_humanize_bytes(trash_bytes)})" if trash_bytes else "")
+          + "\n")
     for top in sorted(grouped):
         pairs = grouped[top]
         print(f"[{top}/]  ({len(pairs)} 件)")
@@ -348,6 +376,13 @@ def cmd_preview(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- apply
 def cmd_apply(args: argparse.Namespace) -> int:
     import shutil
+    import signal
+
+    # --dry-run なら preview と等価な挙動にして安全側に倒す
+    if getattr(args, "dry_run", False):
+        # preview と同じ引数で委譲（limit はデフォルト 20）
+        pv_args = argparse.Namespace(dir=args.dir, infile=args.infile, limit=20)
+        return cmd_preview(pv_args)
 
     root = Path(args.dir).expanduser().resolve()
     data, moves = _load_plan(args.infile)
@@ -361,12 +396,15 @@ def cmd_apply(args: argparse.Namespace) -> int:
             return 1
         try:
             src = _resolve_src(root, src_rel)
-            _safe_join(root, dst_rel)  # to が root 外なら弾く
+            dst_check = _safe_join(root, dst_rel)  # to が root 外なら弾く
         except ValueError as e:
             print(f"エラー: {e}", file=sys.stderr)
             return 1
         if not src.is_file():
             print(f"エラー: 存在しないファイル: {src_rel}", file=sys.stderr)
+            return 1
+        if src.resolve() == dst_check.resolve():
+            print(f"エラー: 移動元と移動先が同じです: {src_rel}", file=sys.stderr)
             return 1
         planned.append((src, dst_rel, m.get("reason", "")))
 
@@ -378,6 +416,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = log_dir / f"manifest-{_ts()}.json"
     records: list[dict] = []
+    interrupted = False
 
     def _flush(complete: bool) -> None:
         # 各移動の直後に書き出すことで、途中で中断/クラッシュしても
@@ -388,10 +427,18 @@ def cmd_apply(args: argparse.Namespace) -> int:
         tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, manifest_path)  # アトミックに置き換え
 
+    # Ctrl-C を捕まえて、ジャーナルを残してから抜ける。途中までの移動は undo で戻せる。
+    def _sigint(_signum, _frame):
+        nonlocal interrupted
+        interrupted = True
+    prev_sigint = signal.signal(signal.SIGINT, _sigint)
+
     _flush(False)  # 移動前に空のジャーナルを作成
     taken: set[Path] = set()
     try:
         for src, dst_rel, reason in planned:
+            if interrupted:
+                break
             dst = _safe_join(root, dst_rel)
             dst.parent.mkdir(parents=True, exist_ok=True)
             final = _dedupe_dest(dst, taken)
@@ -410,11 +457,23 @@ def cmd_apply(args: argparse.Namespace) -> int:
               file=sys.stderr)
         print(f"元に戻す: python3 organize.py undo \"{root}\"", file=sys.stderr)
         return 1
+    finally:
+        signal.signal(signal.SIGINT, prev_sigint)
+
+    if interrupted:
+        _flush(False)
+        print(f"中断: {len(records)} 件まで完了したところで Ctrl-C を受け取りました。",
+              file=sys.stderr)
+        print(f"記録: {manifest_path}", file=sys.stderr)
+        print(f"完了分を戻すには: python3 organize.py undo \"{root}\"", file=sys.stderr)
+        return 130  # シェル慣例: SIGINT 終了は 128+2
+
     _flush(True)  # 全件完了
 
     moved_trash = sum(1 for r in records if f"/{TRASH_DIR}/" in r["to"])
     print(f"完了: {len(records)} 件を移動しました（うち {moved_trash} 件を {TRASH_DIR}/ へ隔離）。")
     print(f"記録: {manifest_path}")
+    print(f"確認: python3 organize.py verify \"{root}\"")
     print(f"元に戻す: python3 organize.py undo \"{root}\"")
     return 0
 
@@ -424,8 +483,9 @@ def _latest_manifest(root: Path) -> Path | None:
     log_dir = root / LOG_DIR
     if not log_dir.is_dir():
         return None
+    # `.undone` 系（undo 済み / redo で消費済み）はすべて除外。stem を見れば一発で判定できる。
     cands = sorted(p for p in log_dir.glob("manifest-*.json")
-                   if not p.name.endswith(".undone.json"))  # 使用済みは除外
+                   if ".undone" not in p.stem)
     return cands[-1] if cands else None
 
 
@@ -471,6 +531,370 @@ def cmd_undo(args: argparse.Namespace) -> int:
     mpath.rename(consumed)
     print(f"復元完了: {restored} 件を元の場所に戻しました（スキップ {skipped} 件）。")
     print(f"使用済み manifest: {consumed}")
+    return 0
+
+
+# --------------------------------------------------------------------------- suggest
+# 拡張子セット（マジックではなく辞書として束ねて、新しい拡張子が来てもここに足せばよい）
+_IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".heif", ".svg", ".bmp", ".tiff", ".tif"}
+_VID_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".wmv", ".flv"}
+_AUD_EXT = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
+_CODE_EXT = {".py", ".js", ".ts", ".tsx", ".jsx", ".rb", ".go", ".rs", ".java",
+             ".c", ".cpp", ".h", ".hpp", ".cs", ".swift", ".kt", ".scala", ".php", ".lua"}
+_SHELL_EXT = {".sh", ".bash", ".zsh", ".fish"}
+_DATA_EXT = {".csv", ".tsv", ".jsonl", ".parquet", ".sqlite", ".db"}
+_STRUCT_EXT = {".json", ".yaml", ".yml", ".xml", ".toml"}
+_ARCHIVE_EXT = {".zip", ".tar", ".gz", ".bz2", ".7z", ".rar", ".tgz", ".tbz2"}
+_INSTALLER_EXT = {".dmg", ".pkg", ".exe", ".msi", ".deb", ".rpm"}
+_DOC_OFFICE_EXT = {".docx", ".doc", ".pages", ".odt", ".rtf"}
+_DOC_SHEET_EXT = {".xlsx", ".xls", ".numbers", ".ods"}
+_DOC_SLIDE_EXT = {".pptx", ".ppt", ".key", ".odp"}
+_TEXT_EXT = {".md", ".markdown", ".txt", ".rst", ".adoc"}
+
+_CONFIG_NAMES = {
+    "package.json", "tsconfig.json", "pyproject.toml", "Cargo.toml",
+    ".eslintrc.json", ".prettierrc", "Gemfile", "go.mod", "requirements.txt",
+    "Makefile", "Dockerfile", "docker-compose.yml", "vite.config.ts",
+    "next.config.js", "next.config.ts", ".gitignore", ".gitattributes",
+}
+
+_COPY_MARKERS = ("copy", "コピー", "_final", "_copy", " - copy", "(1)", "(2)", "(3)", "(4)", "(5)")
+_INVOICE_KW = ("請求書", "領収書", "invoice", "receipt", "bill")
+_CONTRACT_KW = ("contract", "契約", "規約", "agreement")
+_SPEC_KW = ("仕様", "spec", "design", "設計", "specification")
+
+
+def _classify_dest(f: dict) -> tuple[str, str] | None:
+    """1ファイルの行き先カテゴリパスと理由を返す。判定不能なら None（plan に含めない）。
+
+    返す `to` は宛先ルートからの相対パス。ファイル名は src の basename をそのまま使う
+    （rename しない原則）。
+    """
+    name = Path(f.get("abspath") or f.get("path", "")).name
+    if not name:
+        return None
+    name_low = name.lower()
+    ext = f.get("ext", "")
+    binary = f.get("binary", False)
+    snippet = f.get("snippet") or ""
+
+    # 1. ゴミ候補 → 隔離（scan が junk フラグを付けたものはそのまま信用）
+    if f.get("junk"):
+        reason = f.get("junk_reason") or "不要候補"
+        return (f"{TRASH_DIR}/{name}", reason)
+
+    # 2. シェバン付きはスクリプト扱い（拡張子なしでも捕捉できる）
+    if not binary and snippet.startswith("#!"):
+        return (f"コード/{name}", "シェバン付きスクリプト")
+
+    # 3. 名前で確定する設定ファイル（package.json 等）
+    if name in _CONFIG_NAMES:
+        return (f"コード/設定/{name}", "プロジェクト設定")
+
+    # 4. 拡張子で確定するもの
+    if ext in _IMG_EXT:
+        if any(kw in name_low or kw in name for kw in ("screenshot", "screen shot", "スクリーンショット")):
+            return (f"画像/スクリーンショット/{name}", "スクリーンショット")
+        return (f"画像/{name}", "画像")
+    if ext in _VID_EXT:
+        return (f"動画・音声/録画/{name}", "動画")
+    if ext in _AUD_EXT:
+        return (f"動画・音声/音源/{name}", "音声")
+    if ext in _SHELL_EXT:
+        return (f"コード/shell/{name}", "シェルスクリプト")
+    if ext in _CODE_EXT:
+        return (f"コード/{name}", "ソースコード")
+    if ext in _DATA_EXT:
+        return (f"データ/{name}", "データファイル")
+    if ext in _STRUCT_EXT:
+        # 設定っぽい名前なら設定、それ以外はデータ
+        if any(kw in name_low for kw in ("config", "settings", ".eslintrc", ".prettierrc", "tsconfig", ".babelrc")):
+            return (f"コード/設定/{name}", "設定ファイル")
+        return (f"データ/{name}", "構造化データ")
+    if ext in _ARCHIVE_EXT:
+        return (f"アーカイブ/{name}", "圧縮ファイル")
+    if ext in _INSTALLER_EXT:
+        return (f"インストーラ/{name}", "インストーラ")
+    if ext == ".pdf":
+        if any(kw in name_low or kw in name for kw in _INVOICE_KW):
+            return (f"ドキュメント/請求書/{name}", "請求書/領収書")
+        if any(kw in name_low or kw in name for kw in _CONTRACT_KW):
+            return (f"ドキュメント/契約/{name}", "契約書")
+        if f.get("course_hint"):
+            return (f"ドキュメント/講義/{name}", "講義資料")
+        return (f"ドキュメント/{name}", "PDF")
+    if ext in _DOC_OFFICE_EXT:
+        return (f"ドキュメント/{name}", "Word/Pages")
+    if ext in _DOC_SHEET_EXT:
+        return (f"ドキュメント/表計算/{name}", "表計算")
+    if ext in _DOC_SLIDE_EXT:
+        return (f"ドキュメント/スライド/{name}", "スライド")
+    if ext in _TEXT_EXT:
+        first_line = (snippet.split("\n", 1)[0] if snippet else "").strip()
+        first_low = first_line.lower()
+        if any(kw in first_line or kw in first_low for kw in _SPEC_KW):
+            return (f"ドキュメント/仕様/{name}", "仕様書")
+        if "readme" in name_low or first_low.startswith(("# readme", "## readme")):
+            return (f"ドキュメント/{name}", "README")
+        return (f"ドキュメント/メモ/{name}", "テキストメモ")
+
+    # 拡張子なし・不明 + バイナリは触らない（安全側）。テキストならドキュメント扱い。
+    if not binary:
+        return (f"ドキュメント/{name}", "拡張子不明のテキスト")
+    return None
+
+
+def _dup_primary_score(f: dict) -> tuple:
+    """重複群から「正本」を選ぶための並び順スコア。小さいほど primary 寄り。"""
+    name = Path(f.get("abspath") or f.get("path", "")).name
+    name_low = name.lower()
+    parent_parts = len(Path(f.get("abspath") or f.get("path", "")).parent.parts)
+    has_copy = any(m in name_low or m in name for m in _COPY_MARKERS)
+    mtime_iso = f.get("mtime") or ""
+    return (
+        int(has_copy),         # 0: コピー印なし優先
+        -parent_parts,         # 深い階層（=ちゃんと格納された場所）優先
+        mtime_iso == "",       # mtime が無いものを後ろへ
+        -ord(mtime_iso[0]) if mtime_iso else 0,  # 文字列比較で新しい mtime 優先
+        len(name),             # 短い名前優先
+    )
+
+
+def cmd_suggest(args: argparse.Namespace) -> int:
+    """scan.json を読んで baseline plan.json を組み立てる。
+
+    使い方:
+      - 単一 root を scan した結果 → そのまま「その場整理」プラン（from は相対パス）
+      - 複数 root を scan した結果 → 「集約モード」プラン（from は絶対パス）。
+        この場合 --target で集約先ルートを必ず指定する。
+    """
+    try:
+        scan = json.loads(Path(args.infile).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"エラー: scan.json を読めません: {e}", file=sys.stderr)
+        return 2
+
+    files = scan.get("files", [])
+    if not files:
+        print("scan.json にファイルがありません。", file=sys.stderr)
+        return 1
+    roots = scan.get("roots") or ([scan["root"]] if scan.get("root") else [])
+    multi_root = len(roots) > 1
+
+    if multi_root and not args.target:
+        print("エラー: 複数 root を scan した結果（集約モード）には --target が必要です。",
+              file=sys.stderr)
+        return 2
+
+    if args.target:
+        plan_root = Path(args.target).expanduser().resolve()
+    else:
+        plan_root = Path(roots[0]).resolve()
+
+    # 重複群: 正本を1つ選び、残りは _捨て へ
+    dup_decisions: dict[str, tuple[bool, str]] = {}   # abspath -> (is_primary, group_id)
+    for gi, group in enumerate(scan.get("duplicates", [])):
+        # group は abspath 文字列の配列。files から該当 dict を引き当てる
+        by_path = {f["abspath"]: f for f in files}
+        group_files = [by_path[p] for p in group if p in by_path]
+        if len(group_files) < 2:
+            continue
+        group_sorted = sorted(group_files, key=_dup_primary_score)
+        primary = group_sorted[0]
+        dup_decisions[primary["abspath"]] = (True, f"g{gi:02d}")
+        for f in group_sorted[1:]:
+            dup_decisions[f["abspath"]] = (False, f"g{gi:02d}")
+
+    moves: list[dict] = []
+    skipped: list[dict] = []
+    for f in files:
+        ap = f["abspath"]
+        # 集約モードで宛先ルート内のファイルは「動かさない側」として除外。
+        # その場整理（単一root, target == 単一root）では root 配下を必ず処理する。
+        if multi_root:
+            try:
+                Path(ap).resolve().relative_to(plan_root)
+                # plan_root の中にあるファイルは「すでに整理済み」とみなしてスキップ
+                skipped.append({"abspath": ap, "reason": "宛先ルート内（移動不要）"})
+                continue
+            except ValueError:
+                pass
+
+        dup = dup_decisions.get(ap)
+        if dup and not dup[0]:
+            # 重複の非 primary は _捨て へ
+            name = Path(ap).name
+            dest_rel = f"{TRASH_DIR}/{name}"
+            from_val = ap if multi_root else f["path"]
+            moves.append({
+                "from": from_val,
+                "to": dest_rel,
+                "reason": f"重複（{dup[1]}）の非正本 → 隔離",
+            })
+            continue
+
+        classified = _classify_dest(f)
+        if classified is None:
+            skipped.append({"abspath": ap, "reason": "判定不能（拡張子・内容から行き先を決められず）"})
+            continue
+        dest_rel, why = classified
+        from_val = ap if multi_root else f["path"]
+        moves.append({"from": from_val, "to": dest_rel, "reason": why})
+
+    plan = {
+        "root": str(plan_root),
+        "trash_dir": TRASH_DIR,
+        "generated_by": "suggest",
+        "generated_at": _now(),
+        "mode": "consolidate" if multi_root else "in-place",
+        "moves": moves,
+        "skipped": skipped,
+    }
+
+    out = json.dumps(plan, ensure_ascii=False, indent=2)
+    if args.out:
+        Path(args.out).write_text(out, encoding="utf-8")
+        n_trash = sum(1 for m in moves if m["to"].startswith(f"{TRASH_DIR}/"))
+        print(f"baseline plan を作成: {len(moves)} 件の move（うち {n_trash} 件を {TRASH_DIR}/ へ）")
+        print(f"判定不能で対象外: {len(skipped)} 件")
+        print(f"  → {args.out}")
+        print("次の手順: preview で確認 → 必要に応じて plan を編集 → apply")
+    else:
+        print(out)
+    return 0
+
+
+# --------------------------------------------------------------------------- verify
+def cmd_verify(args: argparse.Namespace) -> int:
+    """直近 apply の整合性を確認する。
+
+    各 move について:
+      - from のパスにファイルが残っていないこと（=ちゃんと移動された）
+      - to のパスにファイルが存在すること
+    を確かめる。manifest が無ければ assess と同じ exit 2。
+    """
+    root = Path(args.dir).expanduser().resolve()
+    mpath = Path(args.manifest) if args.manifest else _latest_manifest(root)
+    if not mpath or not mpath.is_file():
+        print("エラー: manifest が見つかりません（apply されていない可能性）。", file=sys.stderr)
+        return 2
+
+    manifest = json.loads(mpath.read_text(encoding="utf-8"))
+    moves = manifest.get("moves", [])
+    if not moves:
+        print(f"manifest に moves がありません: {mpath}", file=sys.stderr)
+        return 1
+
+    issues: list[str] = []
+    ok = 0
+    for r in moves:
+        src = Path(r["from"])
+        dst = Path(r["to"])
+        if src.exists():
+            # apply 後に同名ファイルが再生成された可能性は残るが、これは「動かしたのに残ってる」
+            # という追跡対象なので警告として出す。
+            issues.append(f"残存: {src}（移動元にファイルが残っています）")
+            continue
+        if not dst.exists():
+            issues.append(f"消失: {dst}（移動先が見当たりません）")
+            continue
+        ok += 1
+
+    print(f"== 整合性チェック ==")
+    print(f"manifest: {mpath}")
+    print(f"OK: {ok} / {len(moves)} 件")
+    if issues:
+        print(f"問題: {len(issues)} 件")
+        for s in issues:
+            print(f"  - {s}")
+        return 1
+    print("すべての移動が manifest どおりです。")
+    return 0
+
+
+# --------------------------------------------------------------------------- redo
+def _latest_undone(root: Path) -> Path | None:
+    """直近の undo で消費された manifest（再適用候補）を返す。"""
+    log_dir = root / LOG_DIR
+    if not log_dir.is_dir():
+        return None
+    cands = sorted(p for p in log_dir.glob("manifest-*.undone.json")
+                   if not p.name.endswith(".consumed.json"))
+    return cands[-1] if cands else None
+
+
+def cmd_redo(args: argparse.Namespace) -> int:
+    """直前の undo を取り消して apply 後の状態に戻す。
+
+    挙動:
+      1. 最新の `manifest-*.undone.json` を見つける（undo で消費されたもの）
+      2. その中の moves を再実行（from → to）
+      3. 新しい manifest を timestamp 付きで作成（次の undo で戻せるように）
+      4. 元の `.undone.json` を `.undone.consumed.json` にリネーム
+         （同じ undo を二度 redo しないため）
+    """
+    import shutil
+
+    root = Path(args.dir).expanduser().resolve()
+    src_manifest = Path(args.manifest) if args.manifest else _latest_undone(root)
+    if not src_manifest or not src_manifest.is_file():
+        print("エラー: 取り消すべき undo が見つかりません（直前に undo を実行していないか、すでに redo 済み）。",
+              file=sys.stderr)
+        return 2
+
+    data = json.loads(src_manifest.read_text(encoding="utf-8"))
+    moves = data.get("moves", [])
+    if not moves:
+        print(f"対象 undo に moves がありません: {src_manifest}", file=sys.stderr)
+        return 1
+
+    log_dir = root / LOG_DIR
+    log_dir.mkdir(parents=True, exist_ok=True)
+    new_manifest = log_dir / f"manifest-{_ts()}.json"
+    records: list[dict] = []
+
+    def _flush(complete: bool) -> None:
+        out = {"root": str(root), "applied_at": _now(),
+               "complete": complete, "moves": records, "redo_of": str(src_manifest)}
+        tmp = new_manifest.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, new_manifest)
+
+    _flush(False)
+    restored, skipped = 0, 0
+    try:
+        for r in moves:
+            # redo は apply 時のロジックを再現する: from が現在の場所、to が宛先。
+            src = Path(r["from"])
+            dst = Path(r["to"])
+            if not src.exists():
+                # undo で元に戻したはずの場所にファイルが無い（さらに動かされた可能性）。
+                skipped += 1
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            final = _dedupe_dest(dst, set())
+            shutil.move(str(src), str(final))
+            records.append({
+                "from": str(src),
+                "to": str(final),
+                "reason": r.get("reason", "") + " (redo)",
+                "moved_at": _now(),
+            })
+            _flush(False)
+    except OSError as e:
+        _flush(False)
+        print(f"エラー: redo 中に失敗しました（{e}）。{len(records)} 件まで完了。",
+              file=sys.stderr)
+        return 1
+    _flush(True)
+
+    consumed = src_manifest.with_name(src_manifest.name.replace(".undone.json", ".undone.consumed.json"))
+    src_manifest.rename(consumed)
+
+    print(f"再適用完了: {len(records)} 件（スキップ {skipped} 件）。")
+    print(f"記録: {new_manifest}")
+    print(f"消費済み undo: {consumed}")
+    print(f"取り消し: python3 organize.py undo \"{root}\"")
     return 0
 
 
@@ -605,6 +1029,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-hash", action="store_true", help="重複検出用のハッシュ計算を省略")
     s.set_defaults(func=cmd_scan)
 
+    sg = sub.add_parser("suggest", help="scan.json から baseline plan.json を自動生成")
+    sg.add_argument("--in", dest="infile", required=True, help="入力 scan.json")
+    sg.add_argument("--out", default=None, help="出力先 plan.json（省略時は標準出力）")
+    sg.add_argument("--target", default=None,
+                    help="集約モード（複数 root 走査時）の宛先ルート。単一 root では省略可")
+    sg.set_defaults(func=cmd_suggest)
+
     pv = sub.add_parser("preview", help="plan.json を検証して dry-run 表示")
     pv.add_argument("dir", help="宛先ルート（_捨て/_整理ログ を置く場所。全 to はこの中に入る）")
     pv.add_argument("--in", dest="infile", required=True, help="plan.json")
@@ -615,12 +1046,24 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("dir", help="宛先ルート（_捨て/_整理ログ を置く場所。全 to はこの中に入る）")
     ap.add_argument("--in", dest="infile", required=True, help="plan.json")
     ap.add_argument("--yes", action="store_true", help="確認をスキップして実行")
+    ap.add_argument("--dry-run", action="store_true", help="preview と等価（移動しない）")
     ap.set_defaults(func=cmd_apply)
+
+    vf = sub.add_parser("verify", help="直近 apply の整合性を確認（from が消え、to が存在することを確認）")
+    vf.add_argument("dir", help="apply 時に指定した宛先ルート")
+    vf.add_argument("--manifest", default=None, help="検証する manifest（省略時は最新）")
+    vf.set_defaults(func=cmd_verify)
 
     ud = sub.add_parser("undo", help="最新 manifest を逆再生して復元")
     ud.add_argument("dir", help="apply 時に指定した宛先ルート")
     ud.add_argument("--manifest", default=None, help="使用する manifest（省略時は最新）")
     ud.set_defaults(func=cmd_undo)
+
+    rd = sub.add_parser("redo", help="直前の undo を取り消して apply 後の状態へ戻す")
+    rd.add_argument("dir", help="apply 時に指定した宛先ルート")
+    rd.add_argument("--manifest", default=None,
+                    help="再適用する .undone.json（省略時は最新の消費未済 undo）")
+    rd.set_defaults(func=cmd_redo)
 
     asm = sub.add_parser("assess", help="ディレクトリを診断し skill向き/手動向き を判定")
     asm.add_argument("dir")
