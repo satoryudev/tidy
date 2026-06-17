@@ -481,14 +481,185 @@ def t_preview_shows_size(box: Path):
     check("preview: 隔離分のサイズも表記される", "_捨て/ へ" in pv.stdout, pv.stdout)
 
 
+def t_scan_extracts_python_imports(box: Path):
+    """scan: Python の sibling import / dot relative / 外部 を区別する。"""
+    r = box / "py_deps"
+    r.mkdir()
+    (r / "main.py").write_text(
+        "from helper import greet\n"
+        "from .utils import calc\n"
+        "import os\n"
+        "import requests\n"
+        "print(greet(), calc())\n", encoding="utf-8")
+    (r / "helper.py").write_text("def greet(): return 'hi'\n", encoding="utf-8")
+    (r / "utils.py").write_text("def calc(): return 42\n", encoding="utf-8")
+    sc = run("scan", str(r), "--out", str(box / "py_deps.json"))
+    check("scan/py: rc=0", sc.returncode == 0, sc.stderr)
+    d = json.loads((box / "py_deps.json").read_text(encoding="utf-8"))
+    by_name = {Path(f["abspath"]).name: f for f in d["files"]}
+    main_imports = sorted(Path(p).name for p in by_name["main.py"]["imports"])
+    check("scan/py: sibling と dot relative の両方を解決",
+          main_imports == ["helper.py", "utils.py"], str(main_imports))
+    check("scan/py: 外部 (os, requests) は解決されない",
+          "os" not in str(by_name["main.py"]["imports"]) and "requests" not in str(by_name["main.py"]["imports"]),
+          str(by_name["main.py"]["imports"]))
+    check("scan/py: helper.py は imported_by に main.py を持つ",
+          any("main.py" in p for p in by_name["helper.py"]["imported_by"]),
+          str(by_name["helper.py"]["imported_by"]))
+    clusters = d["code_dependencies"]["clusters"]
+    check("scan/py: 1クラスタ・3メンバー",
+          len(clusters) == 1 and len(clusters[0]["members"]) == 3, str(clusters))
+
+
+def t_scan_extracts_js_html_css(box: Path):
+    """scan: JS の import/require、HTML の src/href、CSS の @import/url を解決する。"""
+    r = box / "web_deps"
+    r.mkdir()
+    (r / "index.js").write_text(
+        "import { Foo } from './bar'\n"
+        "import lodash from 'lodash'\n"
+        "const u = require('./utils.js')\n", encoding="utf-8")
+    (r / "bar.js").write_text("export const Foo = 1\n", encoding="utf-8")
+    (r / "utils.js").write_text("module.exports = 1\n", encoding="utf-8")
+    (r / "page.html").write_text(
+        '<link rel="stylesheet" href="./style.css">\n'
+        '<script src="./app.js"></script>\n'
+        '<img src="https://example.com/x.png">\n', encoding="utf-8")
+    (r / "app.js").write_text("console.log(1)\n", encoding="utf-8")
+    (r / "style.css").write_text("body{color:red}\n", encoding="utf-8")
+    run("scan", str(r), "--out", str(box / "web_deps.json"))
+    d = json.loads((box / "web_deps.json").read_text(encoding="utf-8"))
+    by_name = {Path(f["abspath"]).name: f for f in d["files"]}
+    idx_imports = sorted(Path(p).name for p in by_name["index.js"]["imports"])
+    check("scan/js: 拡張子なしと相対パス両方を解決",
+          idx_imports == ["bar.js", "utils.js"], str(idx_imports))
+    check("scan/js: lodash は解決されない", all("lodash" not in p for p in by_name["index.js"]["imports"]))
+    page_imports = sorted(Path(p).name for p in by_name["page.html"]["imports"])
+    check("scan/html: src と href を解決",
+          page_imports == ["app.js", "style.css"], str(page_imports))
+    check("scan/html: 外部 URL は除外",
+          all("example.com" not in p for p in by_name["page.html"]["imports"]))
+    cluster_names = sorted(c["name"] for c in d["code_dependencies"]["clusters"])
+    check("scan: クラスタ 2 つ（page / index）", "page" in cluster_names and "index" in cluster_names,
+          str(cluster_names))
+
+
+def t_suggest_groups_cluster(box: Path):
+    """suggest: クラスタは同じサブフォルダにまとめる + plan に clusters を埋め込む。"""
+    r = box / "sg_cluster"
+    r.mkdir()
+    (r / "main.py").write_text("from helper import g\n", encoding="utf-8")
+    (r / "helper.py").write_text("def g(): pass\n", encoding="utf-8")
+    (r / "lonely.py").write_text("print('alone')\n", encoding="utf-8")
+    (r / "data.csv").write_text("a,b\n", encoding="utf-8")
+    sc = box / "sg_cl.scan.json"
+    pl = box / "sg_cl.plan.json"
+    run("scan", str(r), "--out", str(sc))
+    run("suggest", "--in", str(sc), "--out", str(pl))
+    plan = json.loads(pl.read_text(encoding="utf-8"))
+    by_from = {m["from"]: m["to"] for m in plan["moves"]}
+    # クラスタの2ファイルが同じディレクトリへ
+    parents = {str(Path(by_from["main.py"]).parent), str(Path(by_from["helper.py"]).parent)}
+    check("suggest/cluster: main.py と helper.py が同じ宛先 dir",
+          len(parents) == 1 and "コード/main" in next(iter(parents)),
+          f"{by_from.get('main.py')} vs {by_from.get('helper.py')}")
+    # 単独ファイルは クラスタ無しの通常分類
+    check("suggest/cluster: 孤立ファイルはクラスタ subfolder に入らない",
+          by_from["lonely.py"] == "コード/lonely.py", by_from.get("lonely.py"))
+    # plan に clusters が埋め込まれている
+    check("suggest/cluster: plan に clusters セクション",
+          isinstance(plan.get("clusters"), list) and len(plan["clusters"]) == 1,
+          str(plan.get("clusters")))
+
+
+def t_preview_warns_on_cluster_split(box: Path):
+    """preview: plan を手で編集してクラスタを分断すると警告が出る。"""
+    r = box / "pv_split"
+    r.mkdir()
+    (r / "a.py").write_text("from b import x\n", encoding="utf-8")
+    (r / "b.py").write_text("x = 1\n", encoding="utf-8")
+    sc = box / "split.scan.json"
+    pl = box / "split.plan.json"
+    run("scan", str(r), "--out", str(sc))
+    run("suggest", "--in", str(sc), "--out", str(pl))
+    # plan を改変: a.py だけ別フォルダへ
+    plan = json.loads(pl.read_text(encoding="utf-8"))
+    for m in plan["moves"]:
+        if m["from"] == "a.py":
+            m["to"] = "コード/別/a.py"
+    pl.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    pv = run("preview", str(r), "--in", str(pl))
+    check("preview/split: クラスタ分断警告が出る",
+          "分断" in pv.stdout and "import が壊れる" in pv.stdout, pv.stdout)
+
+
+def t_preview_warns_on_partial_cluster(box: Path):
+    """preview: クラスタの一部だけが plan に入っていると警告が出る。"""
+    r = box / "pv_partial"
+    r.mkdir()
+    (r / "a.py").write_text("from b import x\n", encoding="utf-8")
+    (r / "b.py").write_text("x = 1\n", encoding="utf-8")
+    sc = box / "partial.scan.json"
+    pl = box / "partial.plan.json"
+    run("scan", str(r), "--out", str(sc))
+    run("suggest", "--in", str(sc), "--out", str(pl))
+    plan = json.loads(pl.read_text(encoding="utf-8"))
+    # b.py を plan から除外（a.py だけ動かして b.py は元の場所に残る形）
+    plan["moves"] = [m for m in plan["moves"] if m["from"] != "b.py"]
+    pl.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    pv = run("preview", str(r), "--in", str(pl))
+    check("preview/partial: 未カバー警告が出る",
+          "未カバー" in pv.stdout, pv.stdout)
+
+
+def t_scan_no_deps_flag(box: Path):
+    """scan --no-deps: 依存解析をスキップしても他は動く。"""
+    r = box / "no_deps"
+    r.mkdir()
+    (r / "a.py").write_text("from b import x\n", encoding="utf-8")
+    (r / "b.py").write_text("x = 1\n", encoding="utf-8")
+    sc = box / "nd.scan.json"
+    run("scan", str(r), "--out", str(sc), "--no-deps")
+    d = json.loads(sc.read_text(encoding="utf-8"))
+    check("scan/no-deps: 依存解析を行わない",
+          d["code_dependencies"]["clusters"] == [] and d["code_dependencies"]["edges"] == [],
+          str(d["code_dependencies"]))
+    check("scan/no-deps: ファイルは全部出る",
+          d["file_count"] == 2, str(d["file_count"]))
+
+
+def t_cluster_keeps_assets_with_html(box: Path):
+    """suggest: HTML が画像を参照しているとき、画像も同じクラスタ subfolder に入る。"""
+    r = box / "html_assets"
+    r.mkdir()
+    (r / "page.html").write_text(
+        '<img src="./logo.png">\n<link href="./style.css">\n', encoding="utf-8")
+    (r / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    (r / "style.css").write_text("body{}\n", encoding="utf-8")
+    sc = box / "html.scan.json"
+    pl = box / "html.plan.json"
+    run("scan", str(r), "--out", str(sc))
+    run("suggest", "--in", str(sc), "--out", str(pl))
+    plan = json.loads(pl.read_text(encoding="utf-8"))
+    by_from = {m["from"]: m["to"] for m in plan["moves"]}
+    parents = {str(Path(p).parent) for p in by_from.values()
+               if Path(p).name in {"page.html", "logo.png", "style.css"}}
+    check("suggest/assets: HTML 参照アセットが同じ dir にまとまる",
+          len(parents) == 1, str(by_from))
+
+
 CASES = [
     t_inplace_roundtrip, t_junk_and_types, t_consolidate_dedupe, t_collision,
     t_preview_uncovered, t_safety_escape, t_requires_yes, t_interrupt_resilience,
     t_undo_twice, t_assess_project, t_assess_clutter, t_assess_small, t_assess_organized,
-    # new
     t_suggest_inplace, t_suggest_consolidate, t_verify_clean_and_dirty,
     t_verify_no_manifest, t_redo_after_undo, t_self_move_rejected,
     t_apply_dry_run, t_preview_shows_size,
+    # dependency-aware
+    t_scan_extracts_python_imports, t_scan_extracts_js_html_css,
+    t_suggest_groups_cluster, t_preview_warns_on_cluster_split,
+    t_preview_warns_on_partial_cluster, t_scan_no_deps_flag,
+    t_cluster_keeps_assets_with_html,
 ]
 
 

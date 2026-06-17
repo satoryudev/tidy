@@ -63,6 +63,19 @@ python3 scripts/organize.py scan ~/Downloads ~/Desktop "~/Documents/講義" --ou
 拡張子・バイナリ判定・**先頭スニペット**・`sha1`・ゴミ候補フラグ・`course_hint`（講義資料らしさ）が入る。
 `duplicates` には**場所をまたいで**同一内容（同 sha1）のファイル組が絶対パスで並ぶ。
 
+scan は **コード依存（import/参照）も解析**する。各コードファイル (`.py .js .ts .tsx .html .css .md .sh`)
+を読み、resolve できた依存先を `imports` / `imported_by` として埋める。さらに連結したファイル群を
+`code_dependencies.clusters` としてまとめる（例: `main.py` + `helper.py` + `utils.py` が1クラスタ）。
+解析対象:
+- Python: `from X import Y`（dot relative 含む）/ `import X`（sibling 慣習）
+- JS/TS: `import ... from './X'` / `require('./X')` / `import('./X')`
+- HTML: `src=` / `href=` の **ローカル参照**
+- CSS: `@import` / `url(...)`
+- Markdown: 画像 `![](./X.png)` の **ローカル参照**
+
+クラスタ情報は次の `suggest` で「import が壊れないように一緒に配置する」ために使われる。
+巨大ディレクトリでスキャンを速くしたい場合は `--no-deps`。
+
 ### 3. baseline を suggest で生成し、必要なら手で直す
 まず `suggest` で機械的に baseline plan を作る。拡張子・ファイル名・スニペット・重複情報から
 妥当な行き先を埋めてくれるので、ここから差分修正するだけで済む。**ゼロから plan を手書きしない**。
@@ -78,6 +91,10 @@ python3 scripts/organize.py suggest --in /tmp/scan.json --out /tmp/plan.json --t
 - **境界ケースの再判定**: 同じ拡張子でも中身を見れば行き先が違うこと（例: `.json` が設定か
   データか、`.md` が仕様書かメモか）。スニペットを根拠に書き換える。
 - **`_捨て/` 行きの最終確認**: 重複の正本選定や junk 判定をユーザー視点で見直す。
+- **クラスタを分断しない**: suggest はコード依存クラスタ（`main.py` + `helper.py` 等）を同じ
+  subfolder にまとめて配置する。手で `to` を変えるときは**クラスタの全メンバーを同じ宛先に
+  揃える**こと。バラすと import が壊れる。preview が分断を検出して警告するので、警告が
+  出たら必ず修正する。
 - **取り残しを最小化**: plan に入っていないファイルは元の場所に残る。「全部きれいにしたい」
   なら scan.json の全ファイルが plan に登場するようにする。
 

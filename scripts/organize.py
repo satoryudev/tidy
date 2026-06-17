@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from hashlib import sha1
@@ -64,6 +65,186 @@ PROJECT_FILE_MARKERS = {
     "build.gradle", "Makefile", "CMakeLists.txt", "tsconfig.json",
     "requirements.txt", "Gemfile", "setup.py", "composer.json",
 }
+
+# 依存関係スキャン対象。コードファイル + マークアップ。
+DEP_EXTS = {
+    ".py",
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+    ".html", ".htm",
+    ".css", ".scss", ".sass",
+    ".md", ".markdown",
+    ".sh", ".bash",
+}
+# import 抽出のために読む最大バイト数（snippet とは別に、ファイル先頭をもう少し広く見る）。
+DEP_READ_BYTES = 32 * 1024
+
+# 候補解決時に試す拡張子（js の `./foo` → `foo.js` `foo/index.ts` などへ）。
+DEP_RESOLVE_EXTS = (".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".html", ".css", ".scss", ".sass", ".sh")
+
+# 言語別 import 抽出パターン。group(1) が import 先の文字列。
+# 「local かどうか」（外部パッケージ vs 同梱）の判定はこの後 _resolve_dep_target で行う。
+_RE_PY_FROM = re.compile(r"^[ \t]*from[ \t]+(\.+[\w.]*|[\w.]+)[ \t]+import\b", re.MULTILINE)
+_RE_PY_IMPORT = re.compile(r"^[ \t]*import[ \t]+([\w.]+(?:[ \t]*,[ \t]*[\w.]+)*)\b", re.MULTILINE)
+_RE_JS_FROM = re.compile(r"""(?:^|[;\s])(?:import|export)[^'"`;\n]*?from[ \t]+['"]([^'"]+)['"]""", re.MULTILINE)
+_RE_JS_IMPORT_BARE = re.compile(r"""(?:^|[;\s])import[ \t]+['"]([^'"]+)['"]""", re.MULTILINE)
+_RE_JS_REQUIRE = re.compile(r"""\brequire[ \t]*\([ \t]*['"]([^'"]+)['"][ \t]*\)""", re.MULTILINE)
+_RE_JS_DYN = re.compile(r"""\bimport[ \t]*\([ \t]*['"]([^'"]+)['"][ \t]*\)""", re.MULTILINE)
+_RE_HTML_SRC_HREF = re.compile(r"""\b(?:src|href)[ \t]*=[ \t]*['"]([^'"]+)['"]""", re.IGNORECASE)
+_RE_CSS_IMPORT = re.compile(r"""@import[ \t]+(?:url[ \t]*\([ \t]*)?['"]([^'"]+)['"]""")
+_RE_CSS_URL = re.compile(r"""\burl\([ \t]*['"]?([^'")]+)['"]?[ \t]*\)""")
+_RE_MD_LINK = re.compile(r"""!?\[[^\]]*\]\(([^)\s]+)""")
+_RE_SH_SOURCE = re.compile(r"""^[ \t]*(?:source|\.)[ \t]+([^\s;|&]+)""", re.MULTILINE)
+
+
+def _extract_import_targets(text: str, ext: str) -> list[str]:
+    """ファイル本文（先頭 ~32KB）から import 先文字列を抜き出す。
+
+    重複あり・順序保持で返す。外部 URL（http://, data:）は除外するが、外部パッケージ名
+    （`react`, `os` 等）は **含めて** 返す。local かどうかの最終判定は呼び出し側で
+    `_resolve_dep_target` がパス解決の成否で行う（同名パッケージとローカルモジュールの
+    衝突は実際のファイル存在で解決する設計）。
+    """
+    out: list[str] = []
+
+    def add(s: str | None):
+        if not s:
+            return
+        s = s.strip()
+        if not s:
+            return
+        if "://" in s or s.startswith("data:") or s.startswith("#") or s.startswith("mailto:"):
+            return
+        out.append(s)
+
+    if ext == ".py":
+        for m in _RE_PY_FROM.finditer(text):
+            add(m.group(1))
+        for m in _RE_PY_IMPORT.finditer(text):
+            # `import a, b.c` のようにカンマで複数並ぶケース
+            for part in m.group(1).split(","):
+                add(part.strip())
+        return out
+
+    if ext in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
+        for pat in (_RE_JS_FROM, _RE_JS_IMPORT_BARE, _RE_JS_REQUIRE, _RE_JS_DYN):
+            for m in pat.finditer(text):
+                add(m.group(1))
+        return out
+
+    if ext in {".html", ".htm"}:
+        for m in _RE_HTML_SRC_HREF.finditer(text):
+            add(m.group(1))
+        return out
+
+    if ext in {".css", ".scss", ".sass"}:
+        for pat in (_RE_CSS_IMPORT, _RE_CSS_URL):
+            for m in pat.finditer(text):
+                add(m.group(1))
+        return out
+
+    if ext in {".md", ".markdown"}:
+        for m in _RE_MD_LINK.finditer(text):
+            add(m.group(1))
+        return out
+
+    if ext in {".sh", ".bash"}:
+        for m in _RE_SH_SOURCE.finditer(text):
+            add(m.group(1))
+        return out
+
+    return out
+
+
+def _read_for_deps(p: Path) -> str:
+    """import 解析用に先頭 ~32KB をテキストとして読み出す。UTF-8 以外でも errors=replace で進める。"""
+    try:
+        with p.open("r", encoding="utf-8", errors="replace") as f:
+            return f.read(DEP_READ_BYTES).replace("\x00", "")
+    except OSError:
+        return ""
+
+
+def _resolve_dep_target(target: str, source_path: Path, by_path: dict[str, dict]) -> str | None:
+    """target 文字列をスキャン済みファイル群の中の絶対パスに解決する。
+
+    対応:
+      - Python: `.foo` / `..foo` などのドット相対 → ソース親dir基準で foo.py / foo/__init__.py
+      - JS/TS/CSS/HTML/MD: `./foo` / `../bar/foo` などのパス相対 → 拡張子を順に試す
+      - 拡張子なし・ディレクトリ指定 → `/index.{js,ts,...}` も試す
+
+    解決できなければ None（= ローカル依存ではなく外部依存とみなす）。
+    """
+    if not target:
+        return None
+    src_dir = source_path.parent
+
+    # Python のドット相対: `.foo`, `..foo.bar`, `.` (= 同パッケージ)
+    if target.startswith(".") and not target.startswith("./") and not target.startswith("../"):
+        dots = len(target) - len(target.lstrip("."))
+        rest = target[dots:].replace(".", "/") if target[dots:] else ""
+        base = src_dir
+        for _ in range(dots - 1):
+            base = base.parent
+        cands: list[Path] = []
+        if rest:
+            cands.append(base / f"{rest}.py")
+            cands.append(base / rest / "__init__.py")
+        else:
+            cands.append(base / "__init__.py")
+        for c in cands:
+            try:
+                r = str(c.resolve())
+            except OSError:
+                continue
+            if r in by_path and r != str(source_path):
+                return r
+        return None
+
+    # それ以外はパス相対っぽいかどうかで判断
+    is_pathlike = (
+        target.startswith("./")
+        or target.startswith("../")
+        or "/" in target
+        or target.startswith(".")  # ".env" のようなドット始まりファイル
+    )
+    if not is_pathlike:
+        # Python の `from helper import X` のように、同階層にファイルがあれば慣習として local。
+        # JS/TS では `react` のような bare specifier は必ず外部なので試さない。
+        if source_path.suffix.lower() == ".py":
+            mod_path = target.replace(".", "/")
+            cands_py: list[Path] = [
+                src_dir / f"{mod_path}.py",
+                src_dir / mod_path / "__init__.py",
+            ]
+            for c in cands_py:
+                try:
+                    r = str(c.resolve())
+                except OSError:
+                    continue
+                if r in by_path and r != str(source_path):
+                    return r
+        # 解決できない → 外部依存とみなしてスキップ
+        return None
+
+    cands_paths: list[Path] = []
+    base = (src_dir / target)
+    cands_paths.append(base)
+    # 拡張子補完
+    if not base.suffix:
+        for ext_try in DEP_RESOLVE_EXTS:
+            cands_paths.append(Path(str(base) + ext_try))
+    # ディレクトリ index
+    for ext_try in DEP_RESOLVE_EXTS:
+        cands_paths.append(base / f"index{ext_try}")
+
+    for c in cands_paths:
+        try:
+            r = str(c.resolve())
+        except OSError:
+            continue
+        if r in by_path and r != str(source_path):
+            return r
+    return None
 
 
 def _now() -> str:
@@ -151,6 +332,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
     empty_dirs: list[str] = []           # 絶対パス
     by_hash: dict[str, list[str]] = {}   # sha1 -> 絶対パスのリスト（場所をまたいだ重複検出）
 
+    raw_import_targets: dict[str, list[str]] = {}  # abspath -> import 文字列の配列（未解決）
+
     for root in roots:
         for dirpath, dirnames, filenames in os.walk(root):
             d = Path(dirpath)
@@ -176,15 +359,21 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 binary = _looks_binary(head)
                 digest = _hash_file(p) if not args.no_hash else None
                 rel = str(p.relative_to(root))
+                ext = p.suffix.lower()
                 if digest:
                     by_hash.setdefault(digest, []).append(str(p))
+                # 依存抽出用にもう少し広く読む（snippet とは別。コードファイルだけ）
+                if not args.no_deps and not binary and ext in DEP_EXTS:
+                    targets = _extract_import_targets(_read_for_deps(p), ext)
+                    if targets:
+                        raw_import_targets[str(p)] = targets
                 files.append({
                     "abspath": str(p),
                     "path": rel,
                     "root": str(root),
                     "size": size,
                     "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
-                    "ext": p.suffix.lower(),
+                    "ext": ext,
                     "binary": binary,
                     "junk": _junk_reason(p, size) is not None,
                     "junk_reason": _junk_reason(p, size),
@@ -192,6 +381,81 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     "sha1": digest,
                     "snippet": _read_snippet(p, binary, args.max_snippet),
                 })
+
+    # 依存解決＆クラスタ生成（全 root スキャン後にまとめて）
+    by_path = {f["abspath"]: f for f in files}
+    edges: list[dict] = []                     # {"from": abs, "to": abs}
+    per_file_imports: dict[str, list[str]] = {}
+    per_file_imported_by: dict[str, list[str]] = {}
+    for src_abs, targets in raw_import_targets.items():
+        src_path = Path(src_abs)
+        resolved: set[str] = set()
+        for t in targets:
+            r = _resolve_dep_target(t, src_path, by_path)
+            if r:
+                resolved.add(r)
+        if not resolved:
+            continue
+        per_file_imports[src_abs] = sorted(resolved)
+        for r in resolved:
+            per_file_imported_by.setdefault(r, []).append(src_abs)
+            edges.append({"from": src_abs, "to": r})
+
+    # 連結成分（無向）を計算 → コードクラスタ
+    adj: dict[str, set[str]] = {}
+    nodes: set[str] = set()
+    for src_abs, deps_list in per_file_imports.items():
+        nodes.add(src_abs)
+        adj.setdefault(src_abs, set())
+        for d in deps_list:
+            nodes.add(d)
+            adj.setdefault(d, set())
+            adj[src_abs].add(d)
+            adj[d].add(src_abs)
+    visited: set[str] = set()
+    clusters: list[list[str]] = []
+    for n in sorted(nodes):
+        if n in visited:
+            continue
+        stack = [n]
+        comp: list[str] = []
+        while stack:
+            x = stack.pop()
+            if x in visited:
+                continue
+            visited.add(x)
+            comp.append(x)
+            stack.extend(adj.get(x, ()))
+        if len(comp) > 1:
+            clusters.append(sorted(comp))
+
+    # クラスタ名: 最も多くを import している（出次数が高い）ファイルの basename を使う。
+    # 同点ならアルファベット順で安定化。クラスタ ID も付与しておくとレポート時に便利。
+    cluster_records: list[dict] = []
+    for ci, members in enumerate(clusters):
+        # 出次数 = 自分が import しているファイル数（per_file_imports に登録された数）
+        def out_deg(p: str) -> int:
+            return len(per_file_imports.get(p, []))
+        leader = sorted(members, key=lambda p: (-out_deg(p), Path(p).name))[0]
+        name = Path(leader).stem
+        cluster_records.append({
+            "id": f"c{ci:02d}",
+            "name": name,
+            "leader": leader,
+            "members": members,
+        })
+    # 逆引きマップ: abspath -> cluster id
+    member_to_cluster: dict[str, str] = {}
+    for c in cluster_records:
+        for m in c["members"]:
+            member_to_cluster[m] = c["id"]
+
+    # 各 file に imports / imported_by / cluster を埋める
+    for f in files:
+        ap = f["abspath"]
+        f["imports"] = per_file_imports.get(ap, [])
+        f["imported_by"] = sorted(per_file_imported_by.get(ap, []))
+        f["cluster"] = member_to_cluster.get(ap)
 
     duplicates = [sorted(v) for v in by_hash.values() if len(v) > 1]
     report = {
@@ -205,12 +469,19 @@ def cmd_scan(args: argparse.Namespace) -> int:
         "files": sorted(files, key=lambda x: x["abspath"]),
         "empty_dirs": sorted(empty_dirs),
         "duplicates": duplicates,
+        "code_dependencies": {
+            "edges": sorted(edges, key=lambda e: (e["from"], e["to"])),
+            "clusters": cluster_records,
+        },
     }
     out = json.dumps(report, ensure_ascii=False, indent=2)
     if args.out:
         Path(args.out).write_text(out, encoding="utf-8")
         print(f"スキャン完了: {len(files)} ファイル / 重複 {len(duplicates)} 組 / "
               f"空dir {len(empty_dirs)} 個 / 対象 {len(roots)} ディレクトリ")
+        if cluster_records:
+            print(f"  コード依存クラスタ: {len(cluster_records)} 組 "
+                  f"({sum(len(c['members']) for c in cluster_records)} ファイル)")
         print(f"  → {args.out} に書き出しました")
     else:
         print(out)
@@ -349,10 +620,40 @@ def cmd_preview(args: argparse.Namespace) -> int:
             print(f"    … 他 {len(pairs) - args.limit} 件")
         print()
 
+    # 依存クラスタの分断検出: plan に cluster 情報があるとき、それぞれのクラスタの member が
+    # 同じ宛先 dir に揃っているかをチェックする。揃っていなければ「import が壊れる可能性」を警告。
+    plan_clusters = data.get("clusters") or []
+    cluster_warnings: list[str] = []
+    if plan_clusters:
+        from_to: dict[str, str] = {m.get("from"): m.get("to") for m in moves
+                                   if m.get("from") and m.get("to")}
+        for c in plan_clusters:
+            members = c.get("members") or []
+            in_plan = [(m, from_to[m]) for m in members if m in from_to]
+            missing = [m for m in members if m not in from_to]
+            dest_parents = {str(Path(to).parent) for _, to in in_plan}
+            label = f"{c.get('id', '?')}「{c.get('name', '?')}」 ({len(members)} 件)"
+            if len(dest_parents) > 1:
+                cluster_warnings.append(
+                    f"分断: {label} のメンバーが {len(dest_parents)} つの異なる宛先に分かれています:\n"
+                    + "\n".join(f"      {p}/" for p in sorted(dest_parents))
+                )
+            if missing and in_plan:
+                # 部分的に plan に入っている = 一部だけ動いて他は残る → import が壊れる可能性大
+                cluster_warnings.append(
+                    f"未カバー: {label} のうち {len(missing)} 件が plan に含まれていません: "
+                    + ", ".join(missing[: args.limit])
+                )
+
     if collisions:
         print("⚠ 宛先が重複しています（apply 時に自動リネームで回避します）:")
         for c in collisions:
             print(f"    {c}")
+        print()
+    if cluster_warnings:
+        print("⚠ コード依存クラスタの分断/取り残しがあります（import が壊れる可能性）:")
+        for w in cluster_warnings:
+            print(f"    {w}")
         print()
     if uncovered:
         print(f"⚠ plan に含まれていないファイルが {len(uncovered)} 件あります（移動されず元の場所に残ります）:")
@@ -606,6 +907,8 @@ def _classify_dest(f: dict) -> tuple[str, str] | None:
         return (f"コード/{name}", "ソースコード")
     if ext in _DATA_EXT:
         return (f"データ/{name}", "データファイル")
+    if ext in {".html", ".htm", ".css", ".scss", ".sass"}:
+        return (f"コード/{name}", "Web ファイル")
     if ext in _STRUCT_EXT:
         # 設定っぽい名前なら設定、それ以外はデータ
         if any(kw in name_low for kw in ("config", "settings", ".eslintrc", ".prettierrc", "tsconfig", ".babelrc")):
@@ -692,11 +995,11 @@ def cmd_suggest(args: argparse.Namespace) -> int:
         plan_root = Path(roots[0]).resolve()
 
     # 重複群: 正本を1つ選び、残りは _捨て へ
+    by_path_files = {f["abspath"]: f for f in files}
     dup_decisions: dict[str, tuple[bool, str]] = {}   # abspath -> (is_primary, group_id)
     for gi, group in enumerate(scan.get("duplicates", [])):
         # group は abspath 文字列の配列。files から該当 dict を引き当てる
-        by_path = {f["abspath"]: f for f in files}
-        group_files = [by_path[p] for p in group if p in by_path]
+        group_files = [by_path_files[p] for p in group if p in by_path_files]
         if len(group_files) < 2:
             continue
         group_sorted = sorted(group_files, key=_dup_primary_score)
@@ -704,6 +1007,31 @@ def cmd_suggest(args: argparse.Namespace) -> int:
         dup_decisions[primary["abspath"]] = (True, f"g{gi:02d}")
         for f in group_sorted[1:]:
             dup_decisions[f["abspath"]] = (False, f"g{gi:02d}")
+
+    # コード依存クラスタ: 連結したファイル群は同じサブフォルダにまとめて配置する。
+    # クラスタの宛先トップフォルダ（コード/ or ドキュメント/ など）はリーダーの分類から決める。
+    code_deps = scan.get("code_dependencies") or {}
+    clusters = code_deps.get("clusters") or []
+    cluster_dest_dir: dict[str, str] = {}    # cluster_id -> "コード/main" 等の相対 dir
+    cluster_label_for: dict[str, str] = {}   # cluster_id -> 表示名（reason 用）
+    member_to_cluster_id: dict[str, str] = {}
+    for c in clusters:
+        cid = c.get("id") or f"c{len(cluster_dest_dir):02d}"
+        leader_path = c.get("leader") or (c.get("members") or [None])[0]
+        if not leader_path or leader_path not in by_path_files:
+            continue
+        leader_classified = _classify_dest(by_path_files[leader_path])
+        # リーダーが junk 扱いされる稀ケースは無視（クラスタなし扱い）
+        if not leader_classified or leader_classified[0].startswith(f"{TRASH_DIR}/"):
+            continue
+        top_folder = leader_classified[0].split("/", 1)[0]  # "コード" 等
+        # 同名衝突を避けるため、リーダー名にクラスタ id をぶら下げる場合がある
+        # （シンプルさ優先で id は付けず、後段の preview で衝突警告が出れば対応）
+        cname = c.get("name") or Path(leader_path).stem or cid
+        cluster_dest_dir[cid] = f"{top_folder}/{cname}"
+        cluster_label_for[cid] = cname
+        for m in c.get("members", []):
+            member_to_cluster_id[m] = cid
 
     moves: list[dict] = []
     skipped: list[dict] = []
@@ -733,6 +1061,27 @@ def cmd_suggest(args: argparse.Namespace) -> int:
             })
             continue
 
+        # コード依存クラスタに属するファイルは、リーダーの分類先サブフォルダにまとめて配置。
+        # これで `main.py` と `helper.py` が別フォルダにバラけて import が壊れる事故を防ぐ。
+        cid = member_to_cluster_id.get(ap)
+        if cid and cid in cluster_dest_dir:
+            # junk フラグは個別に尊重（.DS_Store がクラスタに紛れても隔離）
+            if f.get("junk"):
+                jreason = f.get("junk_reason") or "不要候補"
+                dest_rel = f"{TRASH_DIR}/{Path(ap).name}"
+                from_val = ap if multi_root else f["path"]
+                moves.append({"from": from_val, "to": dest_rel, "reason": jreason})
+                continue
+            name = Path(ap).name
+            dest_rel = f"{cluster_dest_dir[cid]}/{name}"
+            from_val = ap if multi_root else f["path"]
+            moves.append({
+                "from": from_val,
+                "to": dest_rel,
+                "reason": f"クラスタ「{cluster_label_for[cid]}」({cid}) として一緒に配置",
+            })
+            continue
+
         classified = _classify_dest(f)
         if classified is None:
             skipped.append({"abspath": ap, "reason": "判定不能（拡張子・内容から行き先を決められず）"})
@@ -740,6 +1089,23 @@ def cmd_suggest(args: argparse.Namespace) -> int:
         dest_rel, why = classified
         from_val = ap if multi_root else f["path"]
         moves.append({"from": from_val, "to": dest_rel, "reason": why})
+
+    # plan に含めるクラスタ情報。preview で「クラスタを分断する plan」を警告するために使う。
+    # members は plan の from と直接突き合わせるため、suggest が生成した from 値で表現する。
+    abs_to_from: dict[str, str] = {m["from"]: m["from"] for m in moves}
+    abs_to_from.update({f["abspath"]: (f["abspath"] if multi_root else f["path"])
+                        for f in files})
+    plan_clusters: list[dict] = []
+    for c in clusters:
+        cid = c.get("id")
+        members = [abs_to_from[m] for m in c.get("members", []) if m in abs_to_from]
+        if len(members) < 2:
+            continue
+        plan_clusters.append({
+            "id": cid,
+            "name": c.get("name"),
+            "members": sorted(members),
+        })
 
     plan = {
         "root": str(plan_root),
@@ -749,6 +1115,7 @@ def cmd_suggest(args: argparse.Namespace) -> int:
         "mode": "consolidate" if multi_root else "in-place",
         "moves": moves,
         "skipped": skipped,
+        "clusters": plan_clusters,
     }
 
     out = json.dumps(plan, ensure_ascii=False, indent=2)
@@ -1027,6 +1394,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--out", default=None, help="出力先 JSON（省略時は標準出力）")
     s.add_argument("--max-snippet", type=int, default=SNIPPET_DEFAULT, help="内容スニペットの最大文字数")
     s.add_argument("--no-hash", action="store_true", help="重複検出用のハッシュ計算を省略")
+    s.add_argument("--no-deps", action="store_true",
+                   help="コード依存（import）解析を省略（巨大ディレクトリの高速化用）")
     s.set_defaults(func=cmd_scan)
 
     sg = sub.add_parser("suggest", help="scan.json から baseline plan.json を自動生成")

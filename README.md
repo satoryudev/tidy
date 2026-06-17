@@ -8,6 +8,9 @@
   コードプロジェクトやシステム配下を誤って整理する事故を防ぐ
 - **baseline 自動生成**: `suggest` で scan 結果から plan を自動で組み立て、人間/Claude は差分だけ
   直せばよい状態にする（ゼロから手書きしない）
+- **コード依存を見る**: Python / JS / TS / HTML / CSS / Markdown の import や `src=`/`href=` を解析。
+  `main.py` + `helper.py` のように相互参照しているコード群は1クラスタとしてまとめ、`suggest` は
+  同じ subfolder に配置する。手編集でクラスタを分断したときは preview が警告して import 破壊を防ぐ
 - **削除しない**: 不要ファイルはゴミ箱ではなく隔離ディレクトリ `_捨て/` へ移すだけ
 - **集約 + 重複排除**: 講義資料などが複数の場所に散らばって重複しているのを、1か所に集めて
   同一内容（同 sha1）の重複を1つに絞る（残りは `_捨て/` へ隔離）
@@ -17,7 +20,8 @@
 - **追跡 + 復元 + やり直し**: すべての移動を manifest に記録。`undo` で完全復元（集めたファイルも
   元の散らばっていた場所へ戻る）。やっぱり apply 後がよかったら `redo`
 - **テスト済み**: `tests/run_tests.py` に round-trip・重複排除・衝突・安全性・中断耐性・診断・
-  suggest・verify・redo・自己移動拒否・サイズ表示など **64 項目** の総合テスト
+  suggest・verify・redo・自己移動拒否・サイズ表示・**コード依存解析**（py/js/html/css）・
+  **クラスタ分断警告** など **82 項目** の総合テスト
 - **依存ゼロ**: Python 標準ライブラリのみ（Python 3.9+）
 
 ## インストール
@@ -44,8 +48,9 @@ ln -s "$(pwd)/tidy" ~/.claude/skills/tidy
 ```bash
 # 0. 診断（skill向きか手動向きか）
 python3 scripts/organize.py assess "<対象dir>"
-# 1. 走査（複数ディレクトリを並べると集約モード用にまとめてスキャン）
+# 1. 走査（複数ディレクトリを並べると集約モード用にまとめてスキャン。コード依存も自動解析）
 python3 scripts/organize.py scan "<対象dir>" [<対象dir2> ...] --out /tmp/scan.json
+#    --no-deps を付けると import 解析を省略（巨大ディレクトリ向け）
 # 2. baseline plan を自動生成（集約モードなら --target で宛先ルート指定）
 python3 scripts/organize.py suggest --in /tmp/scan.json --out /tmp/plan.json [--target ~/Documents/講義資料]
 # 3. プレビュー（移動しない・総サイズ表示）
