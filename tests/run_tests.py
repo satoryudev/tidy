@@ -628,6 +628,45 @@ def t_scan_no_deps_flag(box: Path):
           d["file_count"] == 2, str(d["file_count"]))
 
 
+def t_suggest_cross_target_single_source(box: Path):
+    """suggest: 単一 root をスキャンし --target に別の dir を指定したとき、
+    consolidate モードとして扱われ from が絶対パスになる（〜/Downloads を
+    〜/Documents 下に振り分ける典型ケース）。"""
+    src = box / "x_src"
+    target = box / "x_target"
+    src.mkdir(); target.mkdir()
+    (src / "note.txt").write_text("memo\n", encoding="utf-8")
+    (src / "app.js").write_text("console.log(1)\n", encoding="utf-8")
+    (src / "photo.png").write_bytes(b"\x89PNG")
+    sc = box / "x.scan.json"
+    pl = box / "x.plan.json"
+    run("scan", str(src), "--out", str(sc))
+    sg = run("suggest", "--in", str(sc), "--out", str(pl), "--target", str(target))
+    check("cross-target: suggest rc=0", sg.returncode == 0, sg.stderr)
+
+    plan = json.loads(pl.read_text(encoding="utf-8"))
+    check("cross-target: mode は consolidate", plan["mode"] == "consolidate", plan.get("mode"))
+    abs_count = sum(1 for m in plan["moves"] if Path(m["from"]).is_absolute())
+    check("cross-target: from がすべて絶対パス",
+          abs_count == len(plan["moves"]), str(plan["moves"]))
+
+    # apply まで通って、ファイルが target 配下に出現
+    ap = run("apply", str(target), "--in", str(pl), "--yes")
+    check("cross-target: apply rc=0", ap.returncode == 0, ap.stderr)
+    expected = [target / "コード/app.js", target / "ドキュメント/メモ/note.txt", target / "画像/photo.png"]
+    check("cross-target: ファイルが target 配下に配置される",
+          all(p.is_file() for p in expected), str(expected))
+    # src 側は空になっている
+    leftover = [p for p in src.iterdir() if p.is_file()]
+    check("cross-target: src 側からはファイルが消える", not leftover, str(leftover))
+
+    # undo で元の散らかった src に戻る
+    run("undo", str(target))
+    restored = sorted(p.name for p in src.iterdir() if p.is_file())
+    check("cross-target: undo で src に完全復元",
+          restored == ["app.js", "note.txt", "photo.png"], str(restored))
+
+
 def t_cluster_keeps_assets_with_html(box: Path):
     """suggest: HTML が画像を参照しているとき、画像も同じクラスタ subfolder に入る。"""
     r = box / "html_assets"
@@ -660,6 +699,7 @@ CASES = [
     t_suggest_groups_cluster, t_preview_warns_on_cluster_split,
     t_preview_warns_on_partial_cluster, t_scan_no_deps_flag,
     t_cluster_keeps_assets_with_html,
+    t_suggest_cross_target_single_source,
 ]
 
 

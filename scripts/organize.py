@@ -994,6 +994,12 @@ def cmd_suggest(args: argparse.Namespace) -> int:
     else:
         plan_root = Path(roots[0]).resolve()
 
+    # 「from を絶対パスで書く必要があるか」の判定。
+    # 集約モード（複数 root）はもちろん、単一 root でも target が root と異なる場合
+    # （例: scan ~/Downloads / --target ~/Documents）は from を絶対にしないと
+    # apply が「target からの相対」と解釈して見つけられない。
+    cross_target = multi_root or (args.target and Path(roots[0]).resolve() != plan_root)
+
     # 重複群: 正本を1つ選び、残りは _捨て へ
     by_path_files = {f["abspath"]: f for f in files}
     dup_decisions: dict[str, tuple[bool, str]] = {}   # abspath -> (is_primary, group_id)
@@ -1037,9 +1043,9 @@ def cmd_suggest(args: argparse.Namespace) -> int:
     skipped: list[dict] = []
     for f in files:
         ap = f["abspath"]
-        # 集約モードで宛先ルート内のファイルは「動かさない側」として除外。
-        # その場整理（単一root, target == 単一root）では root 配下を必ず処理する。
-        if multi_root:
+        # 宛先ルート内のファイルは「動かさない側」として除外。
+        # その場整理（target が指定されていない or target == 単一 root）では除外しない。
+        if cross_target:
             try:
                 Path(ap).resolve().relative_to(plan_root)
                 # plan_root の中にあるファイルは「すでに整理済み」とみなしてスキップ
@@ -1053,7 +1059,7 @@ def cmd_suggest(args: argparse.Namespace) -> int:
             # 重複の非 primary は _捨て へ
             name = Path(ap).name
             dest_rel = f"{TRASH_DIR}/{name}"
-            from_val = ap if multi_root else f["path"]
+            from_val = ap if cross_target else f["path"]
             moves.append({
                 "from": from_val,
                 "to": dest_rel,
@@ -1069,12 +1075,12 @@ def cmd_suggest(args: argparse.Namespace) -> int:
             if f.get("junk"):
                 jreason = f.get("junk_reason") or "不要候補"
                 dest_rel = f"{TRASH_DIR}/{Path(ap).name}"
-                from_val = ap if multi_root else f["path"]
+                from_val = ap if cross_target else f["path"]
                 moves.append({"from": from_val, "to": dest_rel, "reason": jreason})
                 continue
             name = Path(ap).name
             dest_rel = f"{cluster_dest_dir[cid]}/{name}"
-            from_val = ap if multi_root else f["path"]
+            from_val = ap if cross_target else f["path"]
             moves.append({
                 "from": from_val,
                 "to": dest_rel,
@@ -1087,13 +1093,13 @@ def cmd_suggest(args: argparse.Namespace) -> int:
             skipped.append({"abspath": ap, "reason": "判定不能（拡張子・内容から行き先を決められず）"})
             continue
         dest_rel, why = classified
-        from_val = ap if multi_root else f["path"]
+        from_val = ap if cross_target else f["path"]
         moves.append({"from": from_val, "to": dest_rel, "reason": why})
 
     # plan に含めるクラスタ情報。preview で「クラスタを分断する plan」を警告するために使う。
     # members は plan の from と直接突き合わせるため、suggest が生成した from 値で表現する。
     abs_to_from: dict[str, str] = {m["from"]: m["from"] for m in moves}
-    abs_to_from.update({f["abspath"]: (f["abspath"] if multi_root else f["path"])
+    abs_to_from.update({f["abspath"]: (f["abspath"] if cross_target else f["path"])
                         for f in files})
     plan_clusters: list[dict] = []
     for c in clusters:
@@ -1112,7 +1118,7 @@ def cmd_suggest(args: argparse.Namespace) -> int:
         "trash_dir": TRASH_DIR,
         "generated_by": "suggest",
         "generated_at": _now(),
-        "mode": "consolidate" if multi_root else "in-place",
+        "mode": "consolidate" if cross_target else "in-place",
         "moves": moves,
         "skipped": skipped,
         "clusters": plan_clusters,
