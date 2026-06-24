@@ -611,6 +611,13 @@ def cmd_preview(args: argparse.Namespace) -> int:
     print(f"移動予定: {len(moves)} 件 / 総サイズ {_humanize_bytes(total_bytes)}"
           + (f" (うち {TRASH_DIR}/ へ {_humanize_bytes(trash_bytes)})" if trash_bytes else "")
           + "\n")
+
+    # サマリヘッダ: トップフォルダごとの件数を1行で並べる。「Documents/ 12件 / 画像/ 3件」のように
+    # 100件の plan でも「どこに何件行くか」を一目で把握できる（v5 追加）。
+    if grouped:
+        summary_parts = [f"{top}/ {len(pairs)}件" for top, pairs in sorted(grouped.items())]
+        print(f"サマリ: {' / '.join(summary_parts)}\n")
+
     for top in sorted(grouped):
         pairs = grouped[top]
         print(f"[{top}/]  ({len(pairs)} 件)")
@@ -1271,6 +1278,218 @@ def cmd_redo(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- review
+def _scan_trash(root: Path) -> list[Path]:
+    """root/_捨て/ を再帰的に走査し、隔離されているファイルの絶対パスを返す。"""
+    trash = root / TRASH_DIR
+    if not trash.is_dir():
+        return []
+    out: list[Path] = []
+    for dirpath, _dirnames, filenames in os.walk(trash):
+        for n in filenames:
+            out.append((Path(dirpath) / n).resolve())
+    return sorted(out)
+
+
+def _collect_trash_history(root: Path) -> dict[str, dict]:
+    """manifest 群を横断して、現在 _捨て に居る各ファイルの来歴を辞書で返す。
+
+    返り値: {現在の絶対パス: {"from": 元の絶対パス, "reason": ..., "moved_at": ISO, "manifest": "..."}}
+    既に undo されたエントリ（.undone.json）は対象外。consumed.json も対象外。
+    """
+    log_dir = root / LOG_DIR
+    out: dict[str, dict] = {}
+    if not log_dir.is_dir():
+        return out
+    for p in sorted(log_dir.glob("manifest-*.json")):
+        if ".undone" in p.stem:
+            continue
+        try:
+            m = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for rec in m.get("moves", []):
+            to = rec.get("to")
+            if not to:
+                continue
+            try:
+                to_abs = str(Path(to).resolve())
+            except OSError:
+                continue
+            # _捨て 配下のみ対象
+            if f"/{TRASH_DIR}/" not in to_abs and not to_abs.endswith(f"/{TRASH_DIR}"):
+                continue
+            out[to_abs] = {
+                "from": rec.get("from"),
+                "reason": rec.get("reason", ""),
+                "moved_at": rec.get("moved_at", ""),
+                "manifest": str(p),
+            }
+    return out
+
+
+def _age_days(iso_ts: str) -> float | None:
+    if not iso_ts:
+        return None
+    try:
+        # `_now()` は ISO with offset; `_ts()` は %Y%m%d-%H%M%S。前者だけ来る想定。
+        t = datetime.fromisoformat(iso_ts)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        now = datetime.now(t.tzinfo)
+        return (now - t).total_seconds() / 86400.0
+    except ValueError:
+        return None
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    """_捨て/ の中身を見渡し、必要に応じて復元 / 物理削除する（v5）。
+
+    list（既定）:
+      _捨て/ にあるファイルを、隔離日時・元の場所・理由つきで一覧表示。
+
+    --restore <pattern>:
+      glob で一致する隔離ファイルを元の場所（manifest の from）へ戻す。
+      apply と同じく宛先衝突時はリネームで回避。
+
+    --purge [--older-than DAYS]:
+      物理削除（tidy の唯一の delete 経路）。明示の --yes が必須で、
+      --older-than を指定したときはその日数より古い隔離ファイルだけが対象。
+      manifest 自体は残し、purge した経緯を別ログ purge-<ts>.jsonl に追記する。
+    """
+    import fnmatch
+    import shutil
+
+    root = Path(args.dir).expanduser().resolve()
+    trash_dir = root / TRASH_DIR
+    if not trash_dir.is_dir():
+        print(f"_捨て/ がありません: {trash_dir}", file=sys.stderr)
+        return 2
+
+    files = _scan_trash(root)
+    history = _collect_trash_history(root)
+
+    def _entry(p: Path) -> dict:
+        h = history.get(str(p), {})
+        return {
+            "path": p,
+            "rel": str(p.relative_to(trash_dir)),
+            "size": p.stat().st_size if p.is_file() else 0,
+            "from": h.get("from"),
+            "reason": h.get("reason", ""),
+            "moved_at": h.get("moved_at", ""),
+            "age_days": _age_days(h.get("moved_at", "")),
+            "tracked": bool(h),
+        }
+
+    entries = [_entry(p) for p in files]
+
+    # ---- restore ----
+    if args.restore:
+        matches = [e for e in entries
+                   if fnmatch.fnmatch(e["rel"], args.restore)
+                   or fnmatch.fnmatch(e["path"].name, args.restore)]
+        if not matches:
+            print(f"パターンに一致する隔離ファイルがありません: {args.restore}", file=sys.stderr)
+            return 1
+        without_origin = [m for m in matches if not m["from"]]
+        if without_origin:
+            print("✕ 復元元が記録されていないファイルがあります（restore できません）:", file=sys.stderr)
+            for m in without_origin:
+                print(f"    {m['rel']}", file=sys.stderr)
+            return 1
+        if not args.yes:
+            print(f"{len(matches)} 件を復元予定:")
+            for m in matches[:20]:
+                print(f"  {m['rel']}  →  {m['from']}")
+            if len(matches) > 20:
+                print(f"  … 他 {len(matches) - 20} 件")
+            print("\n--yes を付けて再実行してください。")
+            return 1
+        restored = 0
+        # 復元の journal は manifest と区別するため別ファイル名にする
+        rlog = root / LOG_DIR / f"restore-{_ts()}.jsonl"
+        rlog.parent.mkdir(parents=True, exist_ok=True)
+        with rlog.open("a", encoding="utf-8") as jf:
+            for m in matches:
+                src = m["path"]
+                dst = Path(m["from"])
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                final = _dedupe_dest(dst, set())
+                shutil.move(str(src), str(final))
+                jf.write(json.dumps({"ts": _now(), "from": str(src), "to": str(final),
+                                     "reason": "review --restore"}, ensure_ascii=False) + "\n")
+                restored += 1
+        print(f"復元完了: {restored} 件を元の場所へ戻しました。")
+        print(f"記録: {rlog}")
+        return 0
+
+    # ---- purge ----
+    if args.purge:
+        targets = list(entries)
+        if args.older_than is not None:
+            targets = [e for e in targets if (e["age_days"] is not None
+                                              and e["age_days"] >= args.older_than)]
+        if not targets:
+            print("削除対象がありません。", file=sys.stderr)
+            return 1
+        if not args.yes:
+            print(f"⚠ 物理削除予定: {len(targets)} 件（合計 {_humanize_bytes(sum(e['size'] for e in targets))}）")
+            for e in targets[:20]:
+                age = f"{e['age_days']:.0f}d" if e["age_days"] is not None else "?"
+                print(f"  {e['rel']}  ({_humanize_bytes(e['size'])}, age {age})")
+            if len(targets) > 20:
+                print(f"  … 他 {len(targets) - 20} 件")
+            print("\n削除は取り消せません。実行するには --yes を付けてください。")
+            return 1
+        plog = root / LOG_DIR / f"purge-{_ts()}.jsonl"
+        plog.parent.mkdir(parents=True, exist_ok=True)
+        purged = 0
+        with plog.open("a", encoding="utf-8") as jf:
+            for e in targets:
+                try:
+                    e["path"].unlink()
+                except OSError as err:
+                    print(f"削除失敗: {e['rel']} ({err})", file=sys.stderr)
+                    continue
+                jf.write(json.dumps({"ts": _now(), "path": str(e["path"]),
+                                     "size": e["size"], "from": e["from"]},
+                                    ensure_ascii=False) + "\n")
+                purged += 1
+        print(f"物理削除: {purged} 件 ({_humanize_bytes(sum(e['size'] for e in targets))})")
+        print(f"記録: {plog}")
+        return 0
+
+    # ---- list（既定） ----
+    if not entries:
+        print(f"_捨て/ は空です: {trash_dir}")
+        return 0
+    total = sum(e["size"] for e in entries)
+    tracked = sum(1 for e in entries if e["tracked"])
+    print(f"== _捨て の中身 ==")
+    print(f"対象: {root}")
+    print(f"ファイル数: {len(entries)} 件 / 合計 {_humanize_bytes(total)} / "
+          f"manifest 追跡済み {tracked}/{len(entries)}\n")
+    for e in entries[: args.limit]:
+        age = f"{e['age_days']:.0f}d 前" if e["age_days"] is not None else "—"
+        size = _humanize_bytes(e["size"])
+        line = f"  {e['rel']}  ({size}, {age})"
+        print(line)
+        if e["reason"]:
+            print(f"      理由: {e['reason']}")
+        if e["from"]:
+            print(f"      元の場所: {e['from']}")
+        if not e["tracked"]:
+            print(f"      ※ manifest 未追跡（手で置かれたか古いログ）")
+    if len(entries) > args.limit:
+        print(f"  … 他 {len(entries) - args.limit} 件")
+    print()
+    print("次の手順:")
+    print("  復元（特定パターン）: review --restore '<glob>' --yes")
+    print("  物理削除（30日より古い）: review --purge --older-than 30 --yes")
+    return 0
+
+
 # --------------------------------------------------------------------------- assess
 def cmd_assess(args: argparse.Namespace) -> int:
     root = Path(args.dir).expanduser().resolve()
@@ -1439,6 +1658,19 @@ def build_parser() -> argparse.ArgumentParser:
     rd.add_argument("--manifest", default=None,
                     help="再適用する .undone.json（省略時は最新の消費未済 undo）")
     rd.set_defaults(func=cmd_redo)
+
+    rv = sub.add_parser("review", help="_捨て/ の中身を一覧 / 復元 / 物理削除する（v5）")
+    rv.add_argument("dir", help="apply 時に指定した宛先ルート")
+    rv.add_argument("--limit", type=int, default=30, help="一覧表示の上限件数")
+    rv.add_argument("--restore", default=None,
+                    help="glob パターン一致の隔離ファイルを元の場所へ戻す（要 --yes）")
+    rv.add_argument("--purge", action="store_true",
+                    help="隔離ファイルを物理削除する（要 --yes、tidy 唯一の delete 経路）")
+    rv.add_argument("--older-than", type=float, default=None,
+                    metavar="DAYS",
+                    help="--purge と併用。指定日数より古いものだけを対象にする")
+    rv.add_argument("--yes", action="store_true", help="restore/purge の確認をスキップ")
+    rv.set_defaults(func=cmd_review)
 
     asm = sub.add_parser("assess", help="ディレクトリを診断し skill向き/手動向き を判定")
     asm.add_argument("dir")

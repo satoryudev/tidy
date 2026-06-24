@@ -628,6 +628,102 @@ def t_scan_no_deps_flag(box: Path):
           d["file_count"] == 2, str(d["file_count"]))
 
 
+def t_review_list_and_restore(box: Path):
+    """review: 一覧表示 → 特定パターンの復元 → undo 二重実行のように
+    すでに復元済みの review --restore は対象なし扱い、を一通り。"""
+    r = box / "rv_box"
+    r.mkdir()
+    (r / "note.txt").write_text("a", encoding="utf-8")
+    (r / ".DS_Store").write_bytes(b"")
+    (r / "junk.tmp").write_text("t", encoding="utf-8")
+    plan = box / "rv.plan.json"
+    write_json(plan, {"root": str(r), "trash_dir": "_捨て", "moves": [
+        {"from": ".DS_Store", "to": "_捨て/.DS_Store", "reason": "システム生成"},
+        {"from": "junk.tmp", "to": "_捨て/junk.tmp", "reason": "一時ファイル"},
+        {"from": "note.txt", "to": "ドキュメント/メモ/note.txt", "reason": "メモ"},
+    ]})
+    run("apply", str(r), "--in", str(plan), "--yes")
+
+    # list
+    lst = run("review", str(r))
+    check("review/list: rc=0", lst.returncode == 0, lst.stderr)
+    check("review/list: 隔離2件を表示",
+          ".DS_Store" in lst.stdout and "junk.tmp" in lst.stdout
+          and "ファイル数: 2 件" in lst.stdout, lst.stdout)
+    check("review/list: 元の場所と理由が出る",
+          "システム生成" in lst.stdout and "元の場所" in lst.stdout, lst.stdout)
+
+    # restore (dry-run なら --yes なしで rc=1 + ファイル動かず)
+    drv = run("review", str(r), "--restore", "*.DS_Store")
+    check("review/restore: --yes 無しは dry-run（rc=1）",
+          drv.returncode == 1 and not (r / ".DS_Store").exists(), drv.stdout)
+
+    # restore --yes
+    rv = run("review", str(r), "--restore", "*.DS_Store", "--yes")
+    check("review/restore --yes: rc=0", rv.returncode == 0, rv.stderr)
+    check("review/restore --yes: .DS_Store が元の場所に戻る",
+          (r / ".DS_Store").exists(), str(list(r.iterdir())))
+    check("review/restore: junk.tmp は _捨て に残っている",
+          (r / "_捨て" / "junk.tmp").exists())
+
+
+def t_review_purge_requires_yes(box: Path):
+    """review --purge: --yes なしでは消えない、--yes 付ければ消える。"""
+    r = box / "rv_purge"
+    r.mkdir()
+    (r / "garbage.tmp").write_text("g", encoding="utf-8")
+    plan = box / "rv_purge.plan.json"
+    write_json(plan, {"root": str(r), "trash_dir": "_捨て", "moves": [
+        {"from": "garbage.tmp", "to": "_捨て/garbage.tmp", "reason": "一時"},
+    ]})
+    run("apply", str(r), "--in", str(plan), "--yes")
+    trash_file = r / "_捨て" / "garbage.tmp"
+    check("review/purge: 隔離されている", trash_file.exists())
+
+    dry = run("review", str(r), "--purge")
+    check("review/purge: --yes 無しでは消えない",
+          dry.returncode == 1 and trash_file.exists(), dry.stdout)
+
+    real = run("review", str(r), "--purge", "--yes")
+    check("review/purge --yes: rc=0", real.returncode == 0, real.stderr)
+    check("review/purge --yes: ファイルが物理削除される", not trash_file.exists())
+    plog = list((r / "_整理ログ").glob("purge-*.jsonl"))
+    check("review/purge: ログが残る", len(plog) == 1, str(plog))
+
+
+def t_review_empty(box: Path):
+    """review: _捨て/ が無い / 空 の挙動。"""
+    r = box / "rv_empty"
+    r.mkdir()
+    no_trash = run("review", str(r))
+    check("review: _捨て/ が無いと rc=2",
+          no_trash.returncode == 2 and "ありません" in no_trash.stderr,
+          no_trash.stderr)
+    (r / "_捨て").mkdir()
+    empty = run("review", str(r))
+    check("review: _捨て/ が空のとき正常に rc=0 で「空です」",
+          empty.returncode == 0 and "空です" in empty.stdout, empty.stdout)
+
+
+def t_preview_summary_header(box: Path):
+    """preview: トップフォルダごとの件数サマリが先頭に出る。"""
+    r = box / "sum"
+    r.mkdir()
+    (r / "a.txt").write_text("a", encoding="utf-8")
+    (r / "b.txt").write_text("b", encoding="utf-8")
+    (r / "c.tmp").write_text("c", encoding="utf-8")
+    plan = box / "sum.plan.json"
+    write_json(plan, {"root": str(r), "trash_dir": "_捨て", "moves": [
+        {"from": "a.txt", "to": "ドキュメント/a.txt"},
+        {"from": "b.txt", "to": "ドキュメント/b.txt"},
+        {"from": "c.tmp", "to": "_捨て/c.tmp"},
+    ]})
+    pv = run("preview", str(r), "--in", str(plan))
+    check("preview/summary: サマリ行が出る", "サマリ:" in pv.stdout, pv.stdout)
+    check("preview/summary: 件数が並ぶ",
+          "ドキュメント/ 2件" in pv.stdout and "_捨て/ 1件" in pv.stdout, pv.stdout)
+
+
 def t_suggest_cross_target_single_source(box: Path):
     """suggest: 単一 root をスキャンし --target に別の dir を指定したとき、
     consolidate モードとして扱われ from が絶対パスになる（〜/Downloads を
@@ -700,6 +796,9 @@ CASES = [
     t_preview_warns_on_partial_cluster, t_scan_no_deps_flag,
     t_cluster_keeps_assets_with_html,
     t_suggest_cross_target_single_source,
+    # v5: review + preview summary
+    t_review_list_and_restore, t_review_purge_requires_yes, t_review_empty,
+    t_preview_summary_header,
 ]
 
 

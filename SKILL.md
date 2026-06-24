@@ -155,6 +155,19 @@ python3 scripts/organize.py verify "<対象dir>"
   python3 scripts/organize.py redo "<対象dir>"
   ```
 
+### 8. _捨て の見回り（review）
+`_捨て/` は時間とともに溜まる。`review` で中身を一覧し、必要なら復元 / 物理削除する:
+```
+python3 scripts/organize.py review "<対象dir>"
+  # → 各ファイルの隔離日時・元の場所・理由が出る
+python3 scripts/organize.py review "<対象dir>" --restore "*.pdf" --yes
+  # → pattern 一致を元の場所へ戻す（apply と同じ衝突回避ロジック）
+python3 scripts/organize.py review "<対象dir>" --purge --older-than 30 --yes
+  # → 30日より古いものを物理削除（tidy の唯一の delete 経路。必ず --yes 必須）
+```
+`review` を案内するタイミング: apply 直後の「報告」の末尾、あるいは「最近 _捨て に何ある？」と聞かれたとき。
+`--purge` は不可逆なので、ユーザの明示的依頼があったときだけ提案する。
+
 ## 集約モード（複数の場所から集めて重複排除）
 
 「講義資料があちこちにあって重複してる、まとめて整理したい」といった依頼向け。

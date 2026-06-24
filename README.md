@@ -19,9 +19,13 @@
 - **整合性検証**: `verify` で from が消えて to が存在することを apply 直後にチェック
 - **追跡 + 復元 + やり直し**: すべての移動を manifest に記録。`undo` で完全復元（集めたファイルも
   元の散らばっていた場所へ戻る）。やっぱり apply 後がよかったら `redo`
+- **`_捨て/` の見回り**: `review` で隔離ファイルを一覧（隔離日時・元の場所・理由つき）、
+  `--restore` で復元、`--purge --older-than 30` で古いものだけ物理削除（tidy 唯一の delete 経路、
+  必ず `--yes` ゲート）
 - **テスト済み**: `tests/run_tests.py` に round-trip・重複排除・衝突・安全性・中断耐性・診断・
   suggest・verify・redo・自己移動拒否・サイズ表示・**コード依存解析**（py/js/html/css）・
-  **クラスタ分断警告** など **82 項目** の総合テスト
+  **クラスタ分断警告**・**cross-target 単一ソース** ・ **review (list/restore/purge)** など
+  **105 項目** の総合テスト
 - **依存ゼロ**: Python 標準ライブラリのみ（Python 3.9+）
 
 ## インストール
@@ -63,6 +67,10 @@ python3 scripts/organize.py verify "<宛先ルート>"
 # 6. 元に戻す / やり直す
 python3 scripts/organize.py undo "<宛先ルート>"
 python3 scripts/organize.py redo "<宛先ルート>"   # 直前の undo を取り消し
+# 7. _捨て の見回り（v5）
+python3 scripts/organize.py review "<宛先ルート>"                         # 一覧（隔離日時・元の場所・理由）
+python3 scripts/organize.py review "<宛先ルート>" --restore "*.pdf" --yes  # pattern 復元
+python3 scripts/organize.py review "<宛先ルート>" --purge --older-than 30 --yes  # 古いものを物理削除（不可逆）
 ```
 
 ## テスト
