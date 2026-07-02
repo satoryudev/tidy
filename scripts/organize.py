@@ -16,6 +16,8 @@
   verify   apply 直後の整合性チェック（from が消え、to が存在することを確認）
   undo     最新 manifest を逆再生して元の状態に完全復元
   redo     直前の undo を取り消し、apply 後の状態へ戻す
+  review   _捨て/ の中身を一覧 / 復元 / 物理削除する（隔離ファイルの後片付け）
+  history  全ての場所で行った操作を ~/.tidy に集約し、1本のタイムラインで表示
 
 2つの使い方:
   - その場整理: 1つのフォルダを中で分類する（plan の from は相対パス）
@@ -253,6 +255,38 @@ def _now() -> str:
 
 def _ts() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _tidy_home() -> Path:
+    """全体の操作履歴を集約するホーム。既定は ~/.tidy。
+
+    テストや隔離実行のために環境変数 TIDY_HOME で差し替えできる。
+    「散らかりの整理」はローカル（同一ボリューム内の rename）で行い、
+    ここに置くのは **来歴の索引だけ**。実ファイルは動かさない設計。
+    """
+    override = os.environ.get("TIDY_HOME")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".tidy"
+
+
+def _record_history(action: str, target: Path, **fields) -> None:
+    """操作の1行を TIDY_HOME/history.jsonl に追記する（ベストエフォート）。
+
+    apply / undo / redo / review-restore / review-purge の成功時に呼ぶ。
+    どの場所を整理しても履歴は1本のタイムラインに集まり、`history` で横断できる。
+    失敗しても本処理は絶対に壊さない（履歴は補助機能なので握りつぶす）。
+    """
+    try:
+        home = _tidy_home()
+        home.mkdir(parents=True, exist_ok=True)
+        rec = {"ts": _now(), "action": action, "target": str(target)}
+        rec.update(fields)
+        line = json.dumps(rec, ensure_ascii=False) + "\n"
+        with (home / "history.jsonl").open("a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        pass  # 履歴が書けなくても整理自体は成功として扱う
 
 
 def _is_reserved(name: str) -> bool:
@@ -779,6 +813,8 @@ def cmd_apply(args: argparse.Namespace) -> int:
     _flush(True)  # 全件完了
 
     moved_trash = sum(1 for r in records if f"/{TRASH_DIR}/" in r["to"])
+    _record_history("apply", root, moves=len(records), trashed=moved_trash,
+                    manifest=str(manifest_path))
     print(f"完了: {len(records)} 件を移動しました（うち {moved_trash} 件を {TRASH_DIR}/ へ隔離）。")
     print(f"記録: {manifest_path}")
     print(f"確認: python3 organize.py verify \"{root}\"")
@@ -837,6 +873,8 @@ def cmd_undo(args: argparse.Namespace) -> int:
 
     consumed = mpath.with_suffix(".undone.json")
     mpath.rename(consumed)
+    _record_history("undo", root, restored=restored, skipped=skipped,
+                    manifest=str(consumed))
     print(f"復元完了: {restored} 件を元の場所に戻しました（スキップ {skipped} 件）。")
     print(f"使用済み manifest: {consumed}")
     return 0
@@ -1271,6 +1309,8 @@ def cmd_redo(args: argparse.Namespace) -> int:
     consumed = src_manifest.with_name(src_manifest.name.replace(".undone.json", ".undone.consumed.json"))
     src_manifest.rename(consumed)
 
+    _record_history("redo", root, moves=len(records), skipped=skipped,
+                    manifest=str(new_manifest))
     print(f"再適用完了: {len(records)} 件（スキップ {skipped} 件）。")
     print(f"記録: {new_manifest}")
     print(f"消費済み undo: {consumed}")
@@ -1420,6 +1460,8 @@ def cmd_review(args: argparse.Namespace) -> int:
                 jf.write(json.dumps({"ts": _now(), "from": str(src), "to": str(final),
                                      "reason": "review --restore"}, ensure_ascii=False) + "\n")
                 restored += 1
+        _record_history("review-restore", root, restored=restored,
+                        pattern=args.restore, log=str(rlog))
         print(f"復元完了: {restored} 件を元の場所へ戻しました。")
         print(f"記録: {rlog}")
         return 0
@@ -1456,7 +1498,10 @@ def cmd_review(args: argparse.Namespace) -> int:
                                      "size": e["size"], "from": e["from"]},
                                     ensure_ascii=False) + "\n")
                 purged += 1
-        print(f"物理削除: {purged} 件 ({_humanize_bytes(sum(e['size'] for e in targets))})")
+        purged_bytes = sum(e["size"] for e in targets)
+        _record_history("review-purge", root, purged=purged, bytes=purged_bytes,
+                        older_than=args.older_than, log=str(plog))
+        print(f"物理削除: {purged} 件 ({_humanize_bytes(purged_bytes)})")
         print(f"記録: {plog}")
         return 0
 
@@ -1487,6 +1532,103 @@ def cmd_review(args: argparse.Namespace) -> int:
     print("次の手順:")
     print("  復元（特定パターン）: review --restore '<glob>' --yes")
     print("  物理削除（30日より古い）: review --purge --older-than 30 --yes")
+    return 0
+
+
+# --------------------------------------------------------------------------- history
+def _read_history() -> list[dict]:
+    """TIDY_HOME/history.jsonl を読んで、記録の配列を返す（新しい順）。"""
+    path = _tidy_home() / "history.jsonl"
+    if not path.is_file():
+        return []
+    out: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # 壊れた行はスキップ（追記専用なので普通は起きない）
+    out.reverse()  # 新しいものを上に
+    return out
+
+
+# action ごとの「1行サマリ」を作る小関数。history 表示の見やすさのためだけの整形。
+def _history_line(rec: dict) -> str:
+    action = rec.get("action", "?")
+    if action == "apply":
+        detail = f"{rec.get('moves', 0)} 件移動" + (
+            f"（うち {rec.get('trashed', 0)} 件を隔離）" if rec.get("trashed") else "")
+    elif action == "undo":
+        detail = f"{rec.get('restored', 0)} 件を復元"
+    elif action == "redo":
+        detail = f"{rec.get('moves', 0)} 件を再適用"
+    elif action == "review-restore":
+        detail = f"{rec.get('restored', 0)} 件を _捨て から復元" + (
+            f"（{rec['pattern']}）" if rec.get("pattern") else "")
+    elif action == "review-purge":
+        b = rec.get("bytes")
+        detail = f"{rec.get('purged', 0)} 件を物理削除" + (
+            f"（{_humanize_bytes(b)}）" if b else "")
+    else:
+        detail = ""
+    return detail
+
+
+# action → 表示ラベル（記号つきで一目で区別できるように）
+_ACTION_LABEL = {
+    "apply": "▸ 整理",
+    "undo": "↩ 取り消し",
+    "redo": "↪ やり直し",
+    "review-restore": "⤴ 復元",
+    "review-purge": "✕ 物理削除",
+}
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    """tidy が今まで全ての場所で行った操作を、1本のタイムラインで表示する（v6）。
+
+    どのディレクトリを整理しても、成功した mutating 操作（apply/undo/redo/
+    review-restore/review-purge）は ~/.tidy/history.jsonl に集約されている。
+    「先週 tidy で何やったっけ」を場所をまたいで振り返れる。
+    --target で特定ディレクトリだけに絞れる。
+    """
+    records = _read_history()
+    home = _tidy_home()
+
+    if args.target:
+        want = str(Path(args.target).expanduser().resolve())
+        records = [r for r in records if r.get("target") == want]
+
+    if not records:
+        where = f"（対象: {args.target}）" if args.target else ""
+        print(f"操作履歴はまだありません{where}。")
+        print(f"（履歴の保存先: {home / 'history.jsonl'}）")
+        return 0
+
+    shown = records[: args.limit]
+    print(f"== tidy 操作履歴 ==")
+    print(f"保存先: {home / 'history.jsonl'}")
+    if args.target:
+        print(f"対象フィルタ: {args.target}")
+    print(f"記録数: {len(records)} 件（最新 {len(shown)} 件を表示）\n")
+
+    for r in shown:
+        ts = r.get("ts", "")
+        # ISO の "2026-06-24T17:24:54+09:00" を "2026-06-24 17:24" 程度に短縮
+        ts_short = ts.replace("T", " ")[:16] if ts else "?"
+        label = _ACTION_LABEL.get(r.get("action", ""), r.get("action", "?"))
+        detail = _history_line(r)
+        print(f"  {ts_short}  {label}  {detail}")
+        if not args.target:
+            print(f"      場所: {r.get('target', '?')}")
+        manifest = r.get("manifest") or r.get("log")
+        if manifest and args.verbose:
+            print(f"      記録: {manifest}")
+
+    if len(records) > args.limit:
+        print(f"\n  … 他 {len(records) - args.limit} 件（--limit で増やせます）")
     return 0
 
 
@@ -1671,6 +1813,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="--purge と併用。指定日数より古いものだけを対象にする")
     rv.add_argument("--yes", action="store_true", help="restore/purge の確認をスキップ")
     rv.set_defaults(func=cmd_review)
+
+    hi = sub.add_parser("history",
+                        help="tidy が全ての場所で行った操作を1本のタイムラインで表示する（v6）")
+    hi.add_argument("--target", default=None,
+                    help="特定ディレクトリの操作だけに絞る")
+    hi.add_argument("--limit", type=int, default=30, help="表示する最大件数")
+    hi.add_argument("--verbose", action="store_true", help="manifest/ログのパスも表示")
+    hi.set_defaults(func=cmd_history)
 
     asm = sub.add_parser("assess", help="ディレクトリを診断し skill向き/手動向き を判定")
     asm.add_argument("dir")

@@ -26,9 +26,14 @@ _passed = 0
 _failed = 0
 
 
-def run(*args: str) -> subprocess.CompletedProcess:
+def run(*args: str, tidy_home: str | None = None) -> subprocess.CompletedProcess:
+    # TIDY_HOME を必ず与えて、実 ~/.tidy を汚さないようにする。個別テストで
+    # 履歴の中身を検証したいときは tidy_home に専用の一時パスを渡す。
+    env = dict(os.environ)
+    if tidy_home is not None:
+        env["TIDY_HOME"] = tidy_home
     return subprocess.run([PY, str(SCRIPT), *args],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, env=env)
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -783,6 +788,84 @@ def t_cluster_keeps_assets_with_html(box: Path):
           len(parents) == 1, str(by_from))
 
 
+def t_history_records_and_timeline(box: Path):
+    """history: apply / undo が ~/.tidy に記録され、タイムラインで新しい順に出る。"""
+    home = box / "hist_home_1"
+    r = box / "hist_box"
+    r.mkdir()
+    (r / "a.txt").write_text("a", encoding="utf-8")
+    (r / "b.txt").write_text("b", encoding="utf-8")
+    plan = box / "hist.plan.json"
+    write_json(plan, {"root": str(r), "trash_dir": "_捨て", "moves": [
+        {"from": "a.txt", "to": "ドキュメント/a.txt"},
+        {"from": "b.txt", "to": "_捨て/b.txt"},
+    ]})
+    # 履歴が空のうちは「まだありません」
+    empty = run("history", tidy_home=str(home))
+    check("history: 初期は空で rc=0", empty.returncode == 0
+          and "まだありません" in empty.stdout, empty.stdout)
+
+    run("apply", str(r), "--in", str(plan), "--yes", tidy_home=str(home))
+    run("undo", str(r), tidy_home=str(home))
+
+    # jsonl が実際に書かれている
+    hpath = home / "history.jsonl"
+    check("history: history.jsonl が作られる", hpath.is_file(), str(home))
+    lines = [json.loads(l) for l in hpath.read_text(encoding="utf-8").splitlines() if l.strip()]
+    actions = [r_["action"] for r_ in lines]
+    check("history: apply と undo が記録される",
+          actions == ["apply", "undo"], str(actions))
+    check("history: apply レコードに件数が入る",
+          lines[0]["action"] == "apply" and lines[0].get("moves") == 2
+          and lines[0].get("trashed") == 1, str(lines[0]))
+
+    # タイムライン表示（新しい順 = undo が先頭）
+    tl = run("history", tidy_home=str(home))
+    check("history: タイムライン rc=0 で2件", tl.returncode == 0
+          and "記録数: 2 件" in tl.stdout, tl.stdout)
+    check("history: 新しい順（取り消しが整理より上）",
+          tl.stdout.index("取り消し") < tl.stdout.index("整理"), tl.stdout)
+
+
+def t_history_target_filter(box: Path):
+    """history --target: 複数の場所を整理しても、1つに絞り込める。"""
+    home = box / "hist_home_2"
+    r1 = box / "hist_t1"
+    r2 = box / "hist_t2"
+    for r in (r1, r2):
+        r.mkdir()
+        (r / "x.txt").write_text("x", encoding="utf-8")
+    for r in (r1, r2):
+        plan = box / f"{r.name}.plan.json"
+        write_json(plan, {"root": str(r), "trash_dir": "_捨て",
+                          "moves": [{"from": "x.txt", "to": "ドキュメント/x.txt"}]})
+        run("apply", str(r), "--in", str(plan), "--yes", tidy_home=str(home))
+
+    allh = run("history", tidy_home=str(home))
+    check("history: 両方の場所が記録される", allh.returncode == 0
+          and "記録数: 2 件" in allh.stdout, allh.stdout)
+
+    filtered = run("history", "--target", str(r1), tidy_home=str(home))
+    check("history --target: 1件に絞れる",
+          "記録数: 1 件" in filtered.stdout
+          and str(r2) not in filtered.stdout, filtered.stdout)
+
+
+def t_history_isolated_from_real_home(box: Path):
+    """history: TIDY_HOME 未指定でも、テストの既定 TIDY_HOME に隔離されている
+    （実 ~/.tidy を汚さないことの間接確認 — 既定 home にレコードが溜まる）。"""
+    default_home = Path(os.environ["TIDY_HOME"])
+    r = box / "hist_iso"
+    r.mkdir()
+    (r / "z.txt").write_text("z", encoding="utf-8")
+    plan = box / "iso.plan.json"
+    write_json(plan, {"root": str(r), "trash_dir": "_捨て",
+                      "moves": [{"from": "z.txt", "to": "ドキュメント/z.txt"}]})
+    run("apply", str(r), "--in", str(plan), "--yes")  # tidy_home 指定なし → 既定
+    check("history: 既定 TIDY_HOME 配下に記録される（実 home を汚さない）",
+          (default_home / "history.jsonl").is_file(), str(default_home))
+
+
 CASES = [
     t_inplace_roundtrip, t_junk_and_types, t_consolidate_dedupe, t_collision,
     t_preview_uncovered, t_safety_escape, t_requires_yes, t_interrupt_resilience,
@@ -799,12 +882,18 @@ CASES = [
     # v5: review + preview summary
     t_review_list_and_restore, t_review_purge_requires_yes, t_review_empty,
     t_preview_summary_header,
+    # v6: cross-location history
+    t_history_records_and_timeline, t_history_target_filter,
+    t_history_isolated_from_real_home,
 ]
 
 
 def main() -> int:
     box = Path(tempfile.mkdtemp(prefix="tidy-test-"))
     print(f"sandbox: {box}\n")
+    # 全テストの既定 TIDY_HOME を sandbox 内に固定し、実 ~/.tidy を汚さない。
+    # 履歴を検証する個別テストは run(..., tidy_home=...) で専用パスを渡す。
+    os.environ["TIDY_HOME"] = str(box / ".tidy-default")
     try:
         for case in CASES:
             print(f"[{case.__name__}]")

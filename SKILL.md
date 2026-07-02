@@ -168,6 +168,21 @@ python3 scripts/organize.py review "<対象dir>" --purge --older-than 30 --yes
 `review` を案内するタイミング: apply 直後の「報告」の末尾、あるいは「最近 _捨て に何ある？」と聞かれたとき。
 `--purge` は不可逆なので、ユーザの明示的依頼があったときだけ提案する。
 
+### 9. 操作履歴を横断で辿る（history）
+apply / undo / redo / review-restore / review-purge の成功時、その1行が
+`~/.tidy/history.jsonl` に集約される。どの場所を整理しても履歴は1本のタイムラインに集まる。
+```
+python3 scripts/organize.py history
+  # → 全ての場所の操作を新しい順に表示（いつ・何を・どこで）
+python3 scripts/organize.py history --target "<対象dir>"
+  # → 特定ディレクトリの操作だけに絞る
+python3 scripts/organize.py history --verbose
+  # → 各操作の manifest / ログのパスも表示
+```
+`history` を案内するタイミング: 「先週 tidy で何やったっけ」「あのフォルダ最後にいつ整理した？」
+と聞かれたとき。**実ファイルは動かさず、来歴の索引だけをホームに置く**設計（整理そのものは
+従来どおりローカルの rename で行う）。環境変数 `TIDY_HOME` で保存先を差し替えられる。
+
 ## 集約モード（複数の場所から集めて重複排除）
 
 「講義資料があちこちにあって重複してる、まとめて整理したい」といった依頼向け。
